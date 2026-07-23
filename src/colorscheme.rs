@@ -22,6 +22,9 @@ mod colorscheme {
         #[qinvokable]
         fn generate(self: Pin<&mut Self>, paths: &QStringList, type_: QString);
 
+        #[qinvokable]
+        fn apply(self: Pin<&mut Self>, maincolor: QString, path: QString, json: QString);
+
         #[qsignal]
         fn generated(self: Pin<&mut Self>, success: bool);
     }
@@ -58,6 +61,24 @@ impl colorscheme::Colorscheme {
             child.wait().map(|s| s.success()).unwrap_or(false)
         } else {
             false
+        };
+        self.generated(success);
+    }
+
+    fn apply(self: Pin<&mut Self>, maincolor: QString, path: QString, json: QString) {
+        let success = {
+            let mut cmd = Command::new("matugen");
+            cmd.arg("color")
+                .arg("hex")
+                .arg(maincolor.to_string())
+                .arg("--config")
+                .arg(path.to_string())
+                .arg("--import-json-string")
+                .arg(json.to_string())
+                .spawn()
+                .and_then(|mut child| child.wait())
+                .map(|s| s.success())
+                .unwrap_or(false)
         };
         self.generated(success);
     }
