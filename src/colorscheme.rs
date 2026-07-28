@@ -17,6 +17,7 @@ mod colorscheme {
         #[qobject]
         #[qml_element]
         #[qml_singleton]
+        #[qproperty(bool, is_running)]
         type Colorscheme = super::ColorschemeRust;
 
         #[qinvokable]
@@ -27,16 +28,21 @@ mod colorscheme {
 
         #[qsignal]
         fn generated(self: Pin<&mut Self>, success: bool);
+
+        #[qsignal]
+        fn applied(self: Pin<&mut Self>, success: bool);
     }
 
     impl cxx_qt::Constructor<()> for Colorscheme {}
 }
 
-pub struct ColorschemeRust;
+pub struct ColorschemeRust {
+    pub is_running: bool,
+}
 
 impl Default for ColorschemeRust {
     fn default() -> Self {
-        Self
+        Self { is_running: false }
     }
 }
 
@@ -45,7 +51,8 @@ impl cxx_qt::Initialize for colorscheme::Colorscheme {
 }
 
 impl colorscheme::Colorscheme {
-    fn generate(self: Pin<&mut Self>, paths: &QStringList, type_: QString) {
+    fn generate(mut self: Pin<&mut Self>, paths: &QStringList, type_: QString) {
+        self.as_mut().set_is_running(true);
         let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
         let success = if let Some(path) = combine_wallpaper(paths) {
             let mut cmd = Command::new("matugen");
@@ -62,10 +69,12 @@ impl colorscheme::Colorscheme {
         } else {
             false
         };
+        self.as_mut().set_is_running(false);
         self.generated(success);
     }
 
-    fn apply(self: Pin<&mut Self>, maincolor: QString, path: QString, json: QString) {
+    fn apply(mut self: Pin<&mut Self>, maincolor: QString, path: QString, json: QString) {
+        self.as_mut().set_is_running(true);
         let success = {
             let mut cmd = Command::new("matugen");
             cmd.arg("color")
@@ -80,7 +89,8 @@ impl colorscheme::Colorscheme {
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        self.generated(success);
+        self.as_mut().set_is_running(false);
+        self.applied(success);
     }
 }
 
