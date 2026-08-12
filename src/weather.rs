@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,13 +6,60 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Timelike;
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QList, QString};
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use urlencoding::encode;
+use open_meteo_rs::forecast::{
+    CellSelection, Elevation, ForecastResultItem, Model, Options, PrecipitationUnit,
+    TemperatureUnit, WindSpeedUnit,
+};
+use open_meteo_rs::geocoding;
+use open_meteo_rs::{Client, Location};
+use serde::Deserialize;
 
-static WEATHER_CACHE: LazyLock<Arc<Mutex<Option<(String, Instant)>>>> =
+const KMH_TO_MPH: f64 = 0.621_371;
+const MB_TO_INHG: f64 = 0.029_53;
+const MM_TO_IN: f64 = 25.4;
+
+const DEFAULT_CURRENT: &[&str] = &[
+    "temperature_2m",
+    "relative_humidity_2m",
+    "apparent_temperature",
+    "precipitation",
+    "weather_code",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "wind_gusts_10m",
+    "surface_pressure",
+    "cloud_cover",
+    "dew_point_2m",
+    "visibility",
+    "uv_index",
+    "is_day",
+];
+const DEFAULT_HOURLY: &[&str] = &[
+    "temperature_2m",
+    "apparent_temperature",
+    "precipitation_probability",
+    "weather_code",
+    "wind_speed_10m",
+];
+const DEFAULT_DAILY: &[&str] = &[
+    "weather_code",
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "sunrise",
+    "sunset",
+    "precipitation_sum",
+    "precipitation_probability_max",
+    "uv_index_max",
+];
+
+fn vec_of(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+static WEATHER_CACHE: LazyLock<Arc<Mutex<Option<(WeatherData, Instant)>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 fn clear_cache() {
@@ -19,15 +67,119 @@ fn clear_cache() {
     *cache = None;
 }
 
-#[derive(Deserialize)]
-struct WeatherApiResponse {
-    location: Location,
-    current: Current,
-    forecast: Forecast,
+#[derive(Deserialize, Default)]
+struct OptsConfig {
+    location: Option<Location>,
+    elevation: Option<ElevationConfig>,
+    minutely_15: Option<Vec<String>>,
+    hourly: Option<Vec<String>>,
+    daily: Option<Vec<String>>,
+    current: Option<Vec<String>>,
+    temperature_unit: Option<String>,
+    wind_speed_unit: Option<String>,
+    precipitation_unit: Option<String>,
+    time_zone: Option<String>,
+    past_days: Option<u8>,
+    forecast_days: Option<u8>,
+    forecast_minutely_15: Option<u16>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    models: Option<Vec<String>>,
+    cell_selection: Option<String>,
+    apikey: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct Location {
+#[serde(untagged)]
+enum ElevationConfig {
+    Nan(String),
+    Value(f64),
+}
+
+struct OptsState {
+    options: Option<Options>,
+    error: Option<String>,
+    generation: u64,
+}
+
+static OPTS_STATE: LazyLock<Arc<Mutex<OptsState>>> = LazyLock::new(|| {
+    Arc::new(Mutex::new(OptsState {
+        options: None,
+        error: None,
+        generation: 0,
+    }))
+});
+
+fn default_options() -> Options {
+    Options {
+        location: match env_coords() {
+            Some((lat, lng)) => Location { lat, lng },
+            None => Location::default(),
+        },
+        current: vec_of(DEFAULT_CURRENT),
+        hourly: vec_of(DEFAULT_HOURLY),
+        daily: vec_of(DEFAULT_DAILY),
+        temperature_unit: Some(TemperatureUnit::Celsius),
+        wind_speed_unit: Some(WindSpeedUnit::Kmh),
+        precipitation_unit: Some(PrecipitationUnit::Millimeters),
+        forecast_days: Some(3),
+        ..Default::default()
+    }
+}
+
+fn build_options(cfg: &OptsConfig) -> Options {
+    let mut opts = Options::default();
+    opts.location = cfg.location.clone().unwrap_or_else(|| match env_coords() {
+        Some((lat, lng)) => Location { lat, lng },
+        None => Location::default(),
+    });
+    opts.elevation = cfg.elevation.as_ref().and_then(|e| match e {
+        ElevationConfig::Nan(s) if s == "nan" => Some(Elevation::Nan),
+        ElevationConfig::Value(v) => Some(Elevation::Value(*v as f32)),
+        _ => None,
+    });
+    opts.minutely_15 = cfg.minutely_15.clone().unwrap_or_default();
+    opts.current = cfg.current.clone().unwrap_or_else(|| vec_of(DEFAULT_CURRENT));
+    opts.hourly = cfg.hourly.clone().unwrap_or_else(|| vec_of(DEFAULT_HOURLY));
+    opts.daily = cfg.daily.clone().unwrap_or_else(|| vec_of(DEFAULT_DAILY));
+    opts.temperature_unit = cfg
+        .temperature_unit
+        .as_deref()
+        .and_then(|s| TemperatureUnit::try_from(s).ok());
+    opts.wind_speed_unit = cfg
+        .wind_speed_unit
+        .as_deref()
+        .and_then(|s| WindSpeedUnit::try_from(s).ok());
+    opts.precipitation_unit = cfg
+        .precipitation_unit
+        .as_deref()
+        .and_then(|s| PrecipitationUnit::try_from(s).ok());
+    opts.time_zone = cfg.time_zone.clone();
+    opts.past_days = cfg.past_days;
+    opts.forecast_days = cfg.forecast_days.or(Some(3));
+    opts.forecast_minutely_15 = cfg.forecast_minutely_15;
+    opts.start_date = cfg
+        .start_date
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    opts.end_date = cfg
+        .end_date
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    opts.models = cfg
+        .models
+        .as_ref()
+        .map(|ms| ms.iter().filter_map(|m| Model::try_from(m.as_str()).ok()).collect());
+    opts.cell_selection = cfg
+        .cell_selection
+        .as_deref()
+        .and_then(|s| CellSelection::try_from(s).ok());
+    opts.apikey = cfg.apikey.clone();
+    opts
+}
+
+#[derive(Clone)]
+struct WeatherData {
     name: String,
     region: String,
     country: String,
@@ -35,132 +187,328 @@ struct Location {
     lon: f64,
     tz_id: String,
     localtime: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Condition {
-    text: String,
-    icon: String,
-}
-
-#[derive(Deserialize)]
-struct Current {
     temp_c: f64,
-    temp_f: f64,
-    condition: Condition,
-    wind_mph: f64,
+    condition_text: String,
+    condition_icon: String,
     wind_kph: f64,
-    wind_degree: u32,
-    wind_dir: String,
+    wind_degree: f64,
     pressure_mb: f64,
-    pressure_in: f64,
     precip_mm: f64,
-    precip_in: f64,
-    humidity: u32,
-    cloud: u32,
+    humidity: f64,
+    cloud: f64,
     feelslike_c: f64,
-    feelslike_f: f64,
-    windchill_c: f64,
-    windchill_f: f64,
-    heatindex_c: f64,
-    heatindex_f: f64,
     dewpoint_c: f64,
-    dewpoint_f: f64,
     vis_km: f64,
-    vis_miles: f64,
     uv: f64,
-    gust_mph: f64,
     gust_kph: f64,
-    is_day: u8,
+    is_day: bool,
     last_updated: String,
+    weather_json: String,
+    forecast_json: String,
+    daily_json: Vec<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct Forecast {
-    forecastday: Vec<ForecastDay>,
+fn c2f(c: f64) -> f64 {
+    c * 9.0 / 5.0 + 32.0
 }
 
-#[derive(Deserialize, Serialize)]
-struct ForecastDay {
-    date: String,
-    date_epoch: i64,
-    day: Day,
-    astro: Astro,
-    hour: Vec<Hour>,
+fn compass(deg: f64) -> String {
+    const DIRS: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
+    let idx = ((deg / 22.5).round() as i64).rem_euclid(16) as usize;
+    DIRS[idx].to_string()
 }
 
-#[derive(Deserialize, Serialize)]
-struct Day {
-    maxtemp_c: f64,
-    maxtemp_f: f64,
-    mintemp_c: f64,
-    mintemp_f: f64,
-    avgtemp_c: f64,
-    avgtemp_f: f64,
-    maxwind_mph: f64,
-    maxwind_kph: f64,
-    totalprecip_mm: f64,
-    totalprecip_in: f64,
-    totalsnow_cm: f64,
-    avgvis_km: f64,
-    avgvis_miles: f64,
-    avghumidity: u32,
-    condition: Condition,
-    uv: f64,
-    daily_will_it_rain: u8,
-    daily_will_it_snow: u8,
-    daily_chance_of_rain: u32,
-    daily_chance_of_snow: u32,
+fn condition(code: f64, is_day: bool) -> (String, String) {
+    let (text, icon) = match code as i64 {
+        0 => ("Clear", if is_day { "clear-day" } else { "clear-night" }),
+        1 => (
+            "Mainly clear",
+            if is_day {
+                "partly-cloudy"
+            } else {
+                "partly-cloudy-night"
+            },
+        ),
+        2 => ("Partly cloudy", "partly-cloudy"),
+        3 => ("Overcast", "cloudy"),
+        45 => ("Fog", "fog"),
+        48 => ("Depositing rime fog", "fog"),
+        51 => ("Light drizzle", "drizzle"),
+        53 => ("Drizzle", "drizzle"),
+        55 => ("Dense drizzle", "drizzle"),
+        56 => ("Light freezing drizzle", "drizzle"),
+        57 => ("Dense freezing drizzle", "drizzle"),
+        61 => ("Light rain", "rain"),
+        63 => ("Rain", "rain"),
+        65 => ("Heavy rain", "rain"),
+        66 => ("Light freezing rain", "rain"),
+        67 => ("Heavy freezing rain", "rain"),
+        71 => ("Light snow", "snow"),
+        73 => ("Snow", "snow"),
+        75 => ("Heavy snow", "snow"),
+        77 => ("Snow grains", "snow"),
+        80 => ("Light rain showers", "rain-shower"),
+        81 => ("Rain showers", "rain-shower"),
+        82 => ("Violent rain showers", "rain-shower"),
+        85 => ("Light snow showers", "snow-shower"),
+        86 => ("Heavy snow showers", "snow-shower"),
+        95 => ("Thunderstorm", "thunderstorm"),
+        96 => ("Thunderstorm with slight hail", "thunderstorm"),
+        99 => ("Thunderstorm with hail", "thunderstorm"),
+        _ => ("Unknown", ""),
+    };
+    (text.to_string(), icon.to_string())
 }
 
-#[derive(Deserialize, Serialize)]
-struct Astro {
-    sunrise: String,
-    sunset: String,
-    moonrise: String,
-    moonset: String,
-    moon_phase: String,
-    moon_illumination: f64,
-    is_moon_up: u8,
-    is_sun_up: u8,
+fn fval(map: &HashMap<String, ForecastResultItem>, key: &str) -> f64 {
+    map.get(key).and_then(|i| i.value.as_f64()).unwrap_or(0.0)
 }
 
-#[derive(Deserialize, Serialize)]
-struct Hour {
-    time_epoch: i64,
-    time: String,
-    temp_c: f64,
-    temp_f: f64,
-    condition: Condition,
-    wind_mph: f64,
-    wind_kph: f64,
-    wind_degree: u32,
-    wind_dir: String,
-    pressure_mb: f64,
-    pressure_in: f64,
-    precip_mm: f64,
-    precip_in: f64,
-    snow_cm: f64,
-    humidity: u32,
-    cloud: u32,
-    feelslike_c: f64,
-    feelslike_f: f64,
-    windchill_c: f64,
-    windchill_f: f64,
-    heatindex_c: f64,
-    heatindex_f: f64,
-    dewpoint_c: f64,
-    dewpoint_f: f64,
-    will_it_rain: u8,
-    will_it_snow: u8,
-    chance_of_rain: u32,
-    chance_of_snow: u32,
-    vis_km: f64,
-    vis_miles: f64,
-    gust_mph: f64,
-    gust_kph: f64,
-    uv: f64,
-    is_day: u8,
+fn hour_is_day(hour: u32) -> bool {
+    (6..=20).contains(&hour)
+}
+
+fn fmt_hhmm(unix: f64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix as i64, 0)
+        .map(|t| t.format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn parse_coords(query: &str) -> Option<(f64, f64)> {
+    let parts: Vec<&str> = query.split(',').collect();
+    if parts.len() == 2 {
+        let lat = parts[0].trim().parse::<f64>().ok()?;
+        let lon = parts[1].trim().parse::<f64>().ok()?;
+        if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) {
+            return Some((lat, lon));
+        }
+    }
+    None
+}
+
+fn env_coords() -> Option<(f64, f64)> {
+    let lat = std::env::var("WEATHER_LAT").ok()?.parse::<f64>().ok()?;
+    let lon = std::env::var("WEATHER_LON").ok()?.parse::<f64>().ok()?;
+    if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) {
+        return Some((lat, lon));
+    }
+    None
+}
+
+async fn geocode(
+    client: &Client,
+    name: String,
+) -> Option<(Location, String, String, String, String)> {
+    if name.trim().is_empty() {
+        return None;
+    }
+    if let Some((lat, lng)) = parse_coords(&name) {
+        return Some((
+            Location { lat, lng },
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
+    }
+    let resp = client
+        .geocoding(geocoding::Options::default().with_name(name).with_count(1))
+        .await
+        .ok()?;
+    let r = resp.results?.into_iter().next()?;
+    Some((
+        Location {
+            lat: r.latitude?,
+            lng: r.longitude?,
+        },
+        r.name.unwrap_or_default(),
+        r.admin1.unwrap_or_default(),
+        r.country.unwrap_or_default(),
+        r.timezone.unwrap_or_default(),
+    ))
+}
+
+async fn resolve_location(client: &Client) -> (Location, String, String, String, String) {
+    if let Some((lat, lng)) = env_coords() {
+        return (
+            Location { lat, lng },
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+    }
+    if let Some(found) = geocode(
+        client,
+        std::env::var("WEATHER_LOCATION").unwrap_or_default(),
+    )
+    .await
+    {
+        return found;
+    }
+    (
+        Location::default(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    )
+}
+
+async fn fetch_weather(client: &Client, opts: &Options) -> Result<WeatherData, String> {
+    let (_, name, region, country, tz_id) = resolve_location(client).await;
+    let loc = Location {
+        lat: opts.location.lat,
+        lng: opts.location.lng,
+    };
+
+    let res = client.forecast(opts.clone()).await.map_err(|e| e.to_string())?;
+
+    let mut data = WeatherData {
+        name,
+        region,
+        country,
+        lat: loc.lat,
+        lon: loc.lng,
+        tz_id,
+        localtime: String::new(),
+        temp_c: 0.0,
+        condition_text: String::new(),
+        condition_icon: String::new(),
+        wind_kph: 0.0,
+        wind_degree: 0.0,
+        pressure_mb: 0.0,
+        precip_mm: 0.0,
+        humidity: 0.0,
+        cloud: 0.0,
+        feelslike_c: 0.0,
+        dewpoint_c: 0.0,
+        vis_km: 0.0,
+        uv: 0.0,
+        gust_kph: 0.0,
+        is_day: false,
+        last_updated: String::new(),
+        weather_json: String::new(),
+        forecast_json: String::new(),
+        daily_json: Vec::new(),
+    };
+
+    if let Some(cur) = res.current {
+        let v = &cur.values;
+        let temp_c = fval(v, "temperature_2m");
+        let is_day = fval(v, "is_day") != 0.0;
+        let (text, icon) = condition(fval(v, "weather_code"), is_day);
+        let localtime = cur.datetime.format("%Y-%m-%d %H:%M").to_string();
+
+        data.temp_c = temp_c;
+        data.condition_text = text;
+        data.condition_icon = icon;
+        data.wind_kph = fval(v, "wind_speed_10m");
+        data.wind_degree = fval(v, "wind_direction_10m");
+        data.pressure_mb = fval(v, "surface_pressure");
+        data.precip_mm = fval(v, "precipitation");
+        data.humidity = fval(v, "relative_humidity_2m");
+        data.cloud = fval(v, "cloud_cover");
+        data.feelslike_c = fval(v, "apparent_temperature");
+        data.dewpoint_c = fval(v, "dew_point_2m");
+        data.vis_km = fval(v, "visibility") / 1000.0;
+        data.uv = fval(v, "uv_index");
+        data.gust_kph = fval(v, "wind_gusts_10m");
+        data.is_day = is_day;
+        data.last_updated = localtime.clone();
+        data.localtime = localtime;
+    }
+
+    let mut hours_json = Vec::new();
+    for hr in res.hourly.unwrap_or_default() {
+        let v = &hr.values;
+        let temp = fval(v, "temperature_2m");
+        let (text, icon) = condition(fval(v, "weather_code"), hour_is_day(hr.datetime.hour()));
+        hours_json.push(serde_json::json!({
+            "time": hr.datetime.format("%Y-%m-%dT%H:%M").to_string(),
+            "temp_c": temp,
+            "temp_f": c2f(temp),
+            "condition": { "text": text, "icon": icon },
+            "wind_kph": fval(v, "wind_speed_10m"),
+            "wind_mph": fval(v, "wind_speed_10m") * KMH_TO_MPH,
+            "feelslike_c": fval(v, "apparent_temperature"),
+            "chance_of_rain": fval(v, "precipitation_probability") as u32,
+        }));
+    }
+
+    let mut days_json = Vec::new();
+    for day in res.daily.unwrap_or_default() {
+        let v = &day.values;
+        let (text, icon) = condition(fval(v, "weather_code"), true);
+        days_json.push(serde_json::json!({
+            "date": day.date.to_string(),
+            "day": {
+                "maxtemp_c": fval(v, "temperature_2m_max"),
+                "mintemp_c": fval(v, "temperature_2m_min"),
+                "maxtemp_f": c2f(fval(v, "temperature_2m_max")),
+                "mintemp_f": c2f(fval(v, "temperature_2m_min")),
+                "condition": { "text": text, "icon": icon },
+                "precip_mm": fval(v, "precipitation_sum"),
+                "chance_of_rain": fval(v, "precipitation_probability_max") as u32,
+                "uv": fval(v, "uv_index_max"),
+            },
+            "astro": {
+                "sunrise": fmt_hhmm(fval(v, "sunrise")),
+                "sunset": fmt_hhmm(fval(v, "sunset")),
+            },
+        }));
+    }
+
+    let current_json = serde_json::json!({
+        "temp_c": data.temp_c,
+        "temp_f": c2f(data.temp_c),
+        "condition": { "text": &data.condition_text, "icon": &data.condition_icon },
+        "wind_kph": data.wind_kph,
+        "wind_mph": data.wind_kph * KMH_TO_MPH,
+        "wind_degree": data.wind_degree,
+        "wind_dir": compass(data.wind_degree),
+        "pressure_mb": data.pressure_mb,
+        "pressure_in": data.pressure_mb * MB_TO_INHG,
+        "precip_mm": data.precip_mm,
+        "precip_in": data.precip_mm / MM_TO_IN,
+        "humidity": data.humidity as u32,
+        "cloud": data.cloud as u32,
+        "feelslike_c": data.feelslike_c,
+        "feelslike_f": c2f(data.feelslike_c),
+        "dewpoint_c": data.dewpoint_c,
+        "dewpoint_f": c2f(data.dewpoint_c),
+        "vis_km": data.vis_km,
+        "vis_miles": data.vis_km * KMH_TO_MPH,
+        "uv": data.uv,
+        "gust_kph": data.gust_kph,
+        "gust_mph": data.gust_kph * KMH_TO_MPH,
+        "is_day": data.is_day,
+        "last_updated": &data.last_updated,
+    });
+
+    let forecast_json_val = serde_json::json!({ "forecastday": days_json });
+    let weather_json_val = serde_json::json!({
+        "location": {
+            "name": &data.name,
+            "region": &data.region,
+            "country": &data.country,
+            "lat": data.lat,
+            "lon": data.lon,
+            "tz_id": &data.tz_id,
+            "localtime": &data.localtime,
+        },
+        "current": current_json,
+        "forecast": forecast_json_val,
+    });
+
+    data.weather_json = weather_json_val.to_string();
+    data.forecast_json = serde_json::to_string(&forecast_json_val).unwrap_or_default();
+    data.daily_json = days_json.iter().map(ToString::to_string).collect();
+
+    Ok(data)
 }
 
 #[cxx_qt::bridge]
@@ -177,6 +525,7 @@ mod weather {
         #[qobject]
         #[qml_element]
         #[qml_singleton]
+        #[qproperty(QString, opts, READ, WRITE = set_opts, NOTIFY = opts_changed)]
         #[qproperty(QString, weather_json)]
         #[qproperty(QString, location_name)]
         #[qproperty(QString, location_region)]
@@ -217,6 +566,11 @@ mod weather {
         #[qproperty(QString, forecast_json)]
         #[qproperty(QList_QString, forecast_days)]
         type Weather = super::WeatherRust;
+
+        #[qsignal]
+        fn opts_changed(self: Pin<&mut Self>);
+
+        fn set_opts(self: Pin<&mut Self>, opts: QString);
     }
 
     impl cxx_qt::Constructor<()> for Weather {}
@@ -225,7 +579,7 @@ mod weather {
 
 pub struct WeatherRust {
     pub running: Arc<AtomicBool>,
-    pub use_curl: bool,
+    pub opts: QString,
     pub weather_json: QString,
     pub location_name: QString,
     pub location_region: QString,
@@ -271,7 +625,7 @@ impl Default for WeatherRust {
     fn default() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(true)),
-            use_curl: false,
+            opts: QString::default(),
             weather_json: QString::default(),
             location_name: QString::default(),
             location_region: QString::default(),
@@ -315,6 +669,31 @@ impl Default for WeatherRust {
     }
 }
 
+impl weather::Weather {
+    pub fn set_opts(mut self: Pin<&mut Self>, opts: QString) {
+        let raw = opts.to_string();
+        self.as_mut().rust_mut().opts = opts;
+        let mut state = OPTS_STATE.lock().unwrap();
+        state.generation = state.generation.wrapping_add(1);
+        if raw.trim().is_empty() {
+            state.options = None;
+            state.error = None;
+        } else {
+            match serde_json::from_str::<OptsConfig>(&raw) {
+                Ok(cfg) => {
+                    state.options = Some(build_options(&cfg));
+                    state.error = None;
+                }
+                Err(e) => {
+                    state.options = None;
+                    state.error = Some(format!("Invalid opts JSON: {e}"));
+                }
+            }
+        }
+        self.as_mut().opts_changed();
+    }
+}
+
 impl Drop for WeatherRust {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
@@ -325,43 +704,42 @@ impl cxx_qt::Initialize for weather::Weather {
     fn initialize(self: Pin<&mut Self>) {
         let qt_thread = self.qt_thread();
         let running = self.rust().running.clone();
-        let use_curl = self.rust().use_curl;
 
         thread::spawn(move || {
-            let client_ip = if use_curl {
-                match std::process::Command::new("curl")
-                    .arg("-s")
-                    .arg("https://api.ipify.org")
-                    .output()
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            String::from_utf8_lossy(&output.stdout).trim().to_string()
-                        } else {
-                            "auto:ip".to_string()
-                        }
-                    }
-                    Err(_) => "auto:ip".to_string(),
-                }
-            } else {
-                "auto:ip".to_string()
-            };
-
-            let api_key = match std::env::var("WEATHER_API") {
-                Ok(k) => k,
-                Err(_) => {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
                     let _ = qt_thread.queue(move |mut this| {
-                        let _ = this.as_mut().set_weather_json(QString::from(
-                            r#"{"error":"WEATHER_API env var not set"}"#,
-                        ));
+                        let _ = this.as_mut().set_weather_json(QString::from(format!(
+                            r#"{{"error":"Failed to start async runtime: {e}"}}"#
+                        )));
                     });
                     return;
                 }
             };
 
+            let client = Client::new();
+            let mut last_gen = u64::MAX;
+
             loop {
                 if !running.load(Ordering::SeqCst) {
                     break;
+                }
+
+                let (state_opts, state_err, generation) = {
+                    let state = OPTS_STATE.lock().unwrap();
+                    (state.options.clone(), state.error.clone(), state.generation)
+                };
+                if generation != last_gen {
+                    last_gen = generation;
+                    clear_cache();
+                    if let Some(err) = state_err {
+                        let _ = qt_thread.queue(move |mut this| {
+                            let _ = this.as_mut().set_weather_json(QString::from(&err));
+                        });
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
                 }
 
                 let now = Instant::now();
@@ -376,50 +754,23 @@ impl cxx_qt::Initialize for weather::Weather {
                     })
                 };
 
-                let weather_data = match cached_data {
+                let data = match cached_data {
                     Some(data) => data,
                     None => {
                         if !running.load(Ordering::SeqCst) {
                             break;
                         }
-                        let client = Client::new();
-                        let url = format!(
-                            "https://api.weatherapi.com/v1/forecast.json?key={}&q={}&days=3&aqi=yes&alerts=no",
-                            api_key,
-                            encode(&client_ip)
-                        );
-                        match client.get(&url).send() {
-                            Ok(resp) if resp.status().is_success() => match resp.text() {
-                                Ok(text) => {
-                                    {
-                                        let mut cache = WEATHER_CACHE.lock().unwrap();
-                                        *cache = Some((text.clone(), now));
-                                    }
-                                    text
+                        let opts = state_opts.unwrap_or_else(default_options);
+                        match rt.block_on(fetch_weather(&client, &opts)) {
+                            Ok(data) => {
+                                {
+                                    let mut cache = WEATHER_CACHE.lock().unwrap();
+                                    *cache = Some((data.clone(), now));
                                 }
-                                Err(_) => {
-                                    let _ = qt_thread.queue(move |mut this| {
-                                        let _ = this.as_mut().set_weather_json(QString::from(
-                                            r#"{"error":"Failed to read weather response"}"#,
-                                        ));
-                                    });
-                                    thread::sleep(Duration::from_secs(1));
-                                    continue;
-                                }
-                            },
-                            Ok(resp) => {
-                                let err = format!(
-                                    r#"{{"error":"Failed to fetch weather data: {}"}}"#,
-                                    resp.status()
-                                );
-                                let _ = qt_thread.queue(move |mut this| {
-                                    let _ = this.as_mut().set_weather_json(QString::from(&err));
-                                });
-                                thread::sleep(Duration::from_secs(1));
-                                continue;
+                                data
                             }
                             Err(e) => {
-                                let err = format!(r#"{{"error":"Request failed: {}"}}"#, e);
+                                let err = format!(r#"{{"error":"Request failed: {e}"}}"#);
                                 let _ = qt_thread.queue(move |mut this| {
                                     let _ = this.as_mut().set_weather_json(QString::from(&err));
                                 });
@@ -430,78 +781,64 @@ impl cxx_qt::Initialize for weather::Weather {
                     }
                 };
 
-                let json = weather_data.clone();
-                let parsed = serde_json::from_str::<WeatherApiResponse>(&weather_data).ok();
-
                 let _ = qt_thread.queue(move |mut this| {
-                    let _ = this.as_mut().set_weather_json(QString::from(&json));
-                    if let Some(ref data) = parsed {
-                        let _ = this
-                            .as_mut()
-                            .set_location_name(QString::from(&data.location.name));
-                        let _ = this
-                            .as_mut()
-                            .set_location_region(QString::from(&data.location.region));
-                        let _ = this
-                            .as_mut()
-                            .set_location_country(QString::from(&data.location.country));
-                        let _ = this.as_mut().set_location_lat(data.location.lat);
-                        let _ = this.as_mut().set_location_lon(data.location.lon);
-                        let _ = this
-                            .as_mut()
-                            .set_location_tz_id(QString::from(&data.location.tz_id));
-                        let _ = this
-                            .as_mut()
-                            .set_location_localtime(QString::from(&data.location.localtime));
-                        let _ = this.as_mut().set_temp_c(data.current.temp_c);
-                        let _ = this.as_mut().set_temp_f(data.current.temp_f);
-                        let _ = this
-                            .as_mut()
-                            .set_condition(QString::from(&data.current.condition.text));
-                        let _ = this
-                            .as_mut()
-                            .set_condition_icon(QString::from(&data.current.condition.icon));
-                        let _ = this.as_mut().set_wind_mph(data.current.wind_mph);
-                        let _ = this.as_mut().set_wind_kph(data.current.wind_kph);
-                        let _ = this.as_mut().set_wind_degree(data.current.wind_degree);
-                        let _ = this
-                            .as_mut()
-                            .set_wind_dir(QString::from(&data.current.wind_dir));
-                        let _ = this.as_mut().set_pressure_mb(data.current.pressure_mb);
-                        let _ = this.as_mut().set_pressure_in(data.current.pressure_in);
-                        let _ = this.as_mut().set_precip_mm(data.current.precip_mm);
-                        let _ = this.as_mut().set_precip_in(data.current.precip_in);
-                        let _ = this.as_mut().set_humidity(data.current.humidity);
-                        let _ = this.as_mut().set_cloud(data.current.cloud);
-                        let _ = this.as_mut().set_feelslike_c(data.current.feelslike_c);
-                        let _ = this.as_mut().set_feelslike_f(data.current.feelslike_f);
-                        let _ = this.as_mut().set_windchill_c(data.current.windchill_c);
-                        let _ = this.as_mut().set_windchill_f(data.current.windchill_f);
-                        let _ = this.as_mut().set_heatindex_c(data.current.heatindex_c);
-                        let _ = this.as_mut().set_heatindex_f(data.current.heatindex_f);
-                        let _ = this.as_mut().set_dewpoint_c(data.current.dewpoint_c);
-                        let _ = this.as_mut().set_dewpoint_f(data.current.dewpoint_f);
-                        let _ = this.as_mut().set_vis_km(data.current.vis_km);
-                        let _ = this.as_mut().set_vis_miles(data.current.vis_miles);
-                        let _ = this.as_mut().set_uv(data.current.uv);
-                        let _ = this.as_mut().set_gust_mph(data.current.gust_mph);
-                        let _ = this.as_mut().set_gust_kph(data.current.gust_kph);
-                        let _ = this
-                            .as_mut()
-                            .set_last_updated(QString::from(&data.current.last_updated));
-                        let _ = this.as_mut().set_is_day(data.current.is_day != 0);
-
-                        let _ = this.as_mut().set_forecast_json(QString::from(
-                            &serde_json::to_string(&data.forecast).unwrap_or_default(),
-                        ));
-                        let mut days = QList::<QString>::default();
-                        for day in &data.forecast.forecastday {
-                            if let Ok(json) = serde_json::to_string(day) {
-                                days.append_clone(&QString::from(&json));
-                            }
-                        }
-                        let _ = this.as_mut().set_forecast_days(days);
+                    let _ = this
+                        .as_mut()
+                        .set_weather_json(QString::from(&data.weather_json));
+                    let _ = this.as_mut().set_location_name(QString::from(&data.name));
+                    let _ = this
+                        .as_mut()
+                        .set_location_region(QString::from(&data.region));
+                    let _ = this
+                        .as_mut()
+                        .set_location_country(QString::from(&data.country));
+                    let _ = this.as_mut().set_location_lat(data.lat);
+                    let _ = this.as_mut().set_location_lon(data.lon);
+                    let _ = this.as_mut().set_location_tz_id(QString::from(&data.tz_id));
+                    let _ = this
+                        .as_mut()
+                        .set_location_localtime(QString::from(&data.localtime));
+                    let _ = this.as_mut().set_temp_c(data.temp_c);
+                    let _ = this.as_mut().set_temp_f(c2f(data.temp_c));
+                    let _ = this
+                        .as_mut()
+                        .set_condition(QString::from(&data.condition_text));
+                    let _ = this
+                        .as_mut()
+                        .set_condition_icon(QString::from(&data.condition_icon));
+                    let _ = this.as_mut().set_wind_mph(data.wind_kph * KMH_TO_MPH);
+                    let _ = this.as_mut().set_wind_kph(data.wind_kph);
+                    let _ = this.as_mut().set_wind_degree(data.wind_degree as u32);
+                    let _ = this
+                        .as_mut()
+                        .set_wind_dir(QString::from(&compass(data.wind_degree)));
+                    let _ = this.as_mut().set_pressure_mb(data.pressure_mb);
+                    let _ = this.as_mut().set_pressure_in(data.pressure_mb * MB_TO_INHG);
+                    let _ = this.as_mut().set_precip_mm(data.precip_mm);
+                    let _ = this.as_mut().set_precip_in(data.precip_mm / MM_TO_IN);
+                    let _ = this.as_mut().set_humidity(data.humidity as u32);
+                    let _ = this.as_mut().set_cloud(data.cloud as u32);
+                    let _ = this.as_mut().set_feelslike_c(data.feelslike_c);
+                    let _ = this.as_mut().set_feelslike_f(c2f(data.feelslike_c));
+                    let _ = this.as_mut().set_dewpoint_c(data.dewpoint_c);
+                    let _ = this.as_mut().set_dewpoint_f(c2f(data.dewpoint_c));
+                    let _ = this.as_mut().set_vis_km(data.vis_km);
+                    let _ = this.as_mut().set_vis_miles(data.vis_km * KMH_TO_MPH);
+                    let _ = this.as_mut().set_uv(data.uv);
+                    let _ = this.as_mut().set_gust_mph(data.gust_kph * KMH_TO_MPH);
+                    let _ = this.as_mut().set_gust_kph(data.gust_kph);
+                    let _ = this
+                        .as_mut()
+                        .set_last_updated(QString::from(&data.last_updated));
+                    let _ = this.as_mut().set_is_day(data.is_day);
+                    let _ = this
+                        .as_mut()
+                        .set_forecast_json(QString::from(&data.forecast_json));
+                    let mut days = QList::<QString>::default();
+                    for d in &data.daily_json {
+                        days.append_clone(&QString::from(d));
                     }
+                    let _ = this.as_mut().set_forecast_days(days);
                 });
 
                 thread::sleep(Duration::from_secs(1));
