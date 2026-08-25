@@ -23,5 +23,7 @@ fn main() {
         .file("src/hardware.rs")
         .file("src/notification.rs")
         .file("src/weather.rs")
+        .file("src/widgets.rs")
+        .cpp_file("src/widgets_helper.h")
         .build();
 }
