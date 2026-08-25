@@ -3,7 +3,6 @@
 #ifndef WIDGETS_HELPER_H
 #define WIDGETS_HELPER_H
 
-#include <QMap>
 #include <QObject>
 #include <QQmlPropertyMap>
 #include <QString>
@@ -11,30 +10,29 @@
 
 namespace rust::widgetstore {
 
-inline QQmlPropertyMap* ws_create() {
+// Creates a QtObject whose dynamic keys are real, enumerable QML properties.
+inline QObject* ws_create() {
     return QQmlPropertyMap::create();
 }
 
-inline QVariant ws_wrap(QQmlPropertyMap* map) {
-    return QVariant::fromValue<QObject*>(map);
+// Wraps a QObject so it can cross the cxx boundary / reach QML.
+inline QVariant ws_wrap(QObject* object) {
+    return QVariant::fromValue<QObject*>(object);
 }
 
-inline QQmlPropertyMap* ws_unwrap(const QVariant& variant) {
-    return static_cast<QQmlPropertyMap*>(variant.value<QObject*>());
-}
-
-inline void ws_insert(QQmlPropertyMap* map, const QString& key, const QVariant& value) {
-    if (map)
-        map->insert(key, value);
-}
-
-inline void ws_seed(QQmlPropertyMap* map, const QMap<QString, QVariant>& props) {
-    if (!map)
+// Writes a dynamic property onto any QObject handed over from QML. Uses
+// QQmlPropertyMap::insert() when possible so the key becomes a proper
+// property (visible/bindable); falls back to setProperty() otherwise.
+inline void ws_set_property(const QVariant& target, const QString& key, const QVariant& value) {
+    QObject* object = target.value<QObject*>();
+    if (!object || key.isEmpty())
         return;
-    for (auto it = props.constBegin(); it != props.constEnd(); ++it)
-        map->insert(it.key(), it.value());
+    if (auto* map = qobject_cast<QQmlPropertyMap*>(object))
+        map->insert(key, value);
+    else
+        object->setProperty(key.toUtf8().constData(), value);
 }
 
-} 
+} // namespace rust::widgetstore
 
-#endif 
+#endif // WIDGETS_HELPER_H
