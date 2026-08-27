@@ -31,11 +31,9 @@ mod widgets {
         #[qml_singleton]
         type Widgets = super::WidgetsRust;
 
-        /// Creates a QtObject and returns it to QML.
         #[qinvokable]
         fn create_object(&self) -> QVariant;
 
-        /// Writes a dynamic property onto the QtObject passed from QML.
         #[qinvokable]
         fn set_property(&self, target: &QVariant, key: &QString, value: &QVariant);
     }

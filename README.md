@@ -238,6 +238,35 @@ System.Weather.opts = JSON.stringify({
 })
 ```
 
+## Widgets — `System.Widgets`
+
+Stateless helpers to create QtObjects from QML and write dynamic properties
+onto them (`QObject::setProperty()`).
+
+### Functions
+
+| Function | Arguments | Description |
+| --- | --- | --- |
+| `create_object()` | — | Creates a plain QtObject and returns it |
+| `set_property(target, key, value)` | `target`: QtObject, `key`: string, `value`: any | Writes a dynamic property onto `target` |
+
+No properties or signals.
+
+Note: dynamic properties written this way have no change signals — readers
+won't re-evaluate automatically when a value changes.
+
+```qml
+import System
+
+Component {
+    id: factory
+    QtObject {}
+}
+
+property var obj: Widgets.createObject()
+Component.onCompleted: Widgets.set_property(obj, "size", 20)
+```
+
 ## Building
 
 ```sh

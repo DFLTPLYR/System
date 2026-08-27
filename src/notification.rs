@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::thread;
 
 use cxx_qt_lib::{QMap, QMapPair_QString_QVariant, QString};
 use notify_rust::Notification;
@@ -48,26 +49,33 @@ impl notification::Notification {
                 .map(|s| s.to_string())
         };
 
-        let mut n = Notification::new();
-        if let Some(appname) = get("appname") {
-            n.appname(&appname);
-        }
-        if let Some(summary) = get("title").or_else(|| get("summary")) {
-            n.summary(&summary);
-        }
-        if let Some(body) = get("body") {
-            n.body(&body);
-        }
-        if let Some(icon) = get("icon") {
-            n.icon(&icon);
-        }
-        if let Some(timeout) = args
+        let appname = get("appname");
+        let summary = get("title").or_else(|| get("summary"));
+        let body = get("body");
+        let icon = get("icon");
+        let timeout = args
             .get(&QString::from("timeout"))
-            .and_then(|v| v.value::<i32>())
-        {
-            n.timeout(timeout);
-        }
+            .and_then(|v| v.value::<i32>());
 
-        let _ = n.show();
+        thread::spawn(move || {
+            let mut n = Notification::new();
+            if let Some(appname) = appname {
+                n.appname(&appname);
+            }
+            if let Some(summary) = summary {
+                n.summary(&summary);
+            }
+            if let Some(body) = body {
+                n.body(&body);
+            }
+            if let Some(icon) = icon {
+                n.icon(&icon);
+            }
+            if let Some(timeout) = timeout {
+                n.timeout(timeout);
+            }
+
+            let _ = n.show();
+        });
     }
 }

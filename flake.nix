@@ -43,7 +43,7 @@
           nativeBuildInputs = with pkgs; [
             cargo rustc
             pkg-config cmake gnumake
-            stdenv.cc
+            stdenv.cc openssl
             qt.qtbase qt.qtdeclarative qt.qttools
           ];
 

@@ -1,3 +1,4 @@
+pub mod colorgen;
 pub mod colorscheme;
 pub mod filemanager;
 pub mod font;

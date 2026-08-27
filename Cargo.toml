@@ -21,6 +21,8 @@ notify-rust = "4"
 rfd = "0.15"
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
+material-colors = { version = "0.4", features = ["image", "serde"] }
+image = "0.25"
 
 [build-dependencies]
 cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"] }
