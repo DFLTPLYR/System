@@ -137,14 +137,19 @@ impl colorgen::ColorGen {
         self.as_mut().set_is_running(true);
 
         let raw = json.to_string();
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&raw);
+
+        // Trim whitespace and BOM
+        let trimmed = raw.trim().trim_start_matches('\u{feff}');
+
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(trimmed);
 
         let value = match parsed {
             Ok(v) => v,
             Err(e) => {
+                let preview: String = trimmed.chars().take(50).collect();
                 self.as_mut().set_is_running(false);
                 self.as_mut()
-                    .error(QString::from(format!("invalid JSON: {e}")));
+                    .error(QString::from(format!("invalid JSON: {e} | preview: {preview}")));
                 self.as_mut().output(QString::default());
                 return;
             }
@@ -401,120 +406,75 @@ fn build_color_map(scheme: &Scheme, is_dark: bool, image: &str) -> HashMap<Strin
         scheme.primary.to_hex_with_pound(),
     );
 
+    map.insert("hover".to_string(), scheme.tertiary.to_hex_with_pound());
+    map.insert("colors.hover".to_string(), scheme.tertiary.to_hex_with_pound());
+    map.insert("on_hover".to_string(), scheme.on_tertiary.to_hex_with_pound());
+    map.insert("colors.on_hover".to_string(), scheme.on_tertiary.to_hex_with_pound());
+
     map
 }
 
 fn build_color_map_from_json(scheme: &serde_json::Value) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
-    let flat_keys = &[
-        "primary",
-        "onprimary",
-        "primarycontainer",
-        "onprimarycontainer",
-        "inverseprimary",
-        "primaryfixed",
-        "primaryfixeddim",
-        "onprimaryfixed",
-        "onprimaryfixedvariant",
-        "secondary",
-        "onsecondary",
-        "secondarycontainer",
-        "onsecondarycontainer",
-        "secondaryfixed",
-        "secondaryfixeddim",
-        "onsecondaryfixed",
-        "onsecondaryfixedvariant",
-        "tertiary",
-        "ontertiary",
-        "tertiarycontainer",
-        "ontertiarycontainer",
-        "tertiaryfixed",
-        "tertiaryfixeddim",
-        "ontertiaryfixed",
-        "ontertiaryfixedvariant",
-        "error",
-        "onerror",
-        "errorcontainer",
-        "onerrorcontainer",
-        "surfacedim",
-        "surface",
-        "surfacetint",
-        "surfacebright",
-        "surfacecontainerlowest",
-        "surfacecontainerlow",
-        "surfacecontainer",
-        "surfacecontainerhigh",
-        "surfacecontainerhighest",
-        "onsurface",
-        "onsurfacevariant",
-        "outline",
-        "outlinevariant",
-        "inversesurface",
-        "inverseonsurface",
-        "surfacevariant",
-        "background",
-        "onbackground",
-        "shadow",
-        "scrim",
-        "hover",
-        "onhover",
+    let color_keys: &[(&str, &str)] = &[
+        ("primary", "primary"),
+        ("on_primary", "onprimary"),
+        ("primary_container", "primarycontainer"),
+        ("on_primary_container", "onprimarycontainer"),
+        ("inverse_primary", "inverseprimary"),
+        ("primary_fixed", "primaryfixed"),
+        ("primary_fixed_dim", "primaryfixeddim"),
+        ("on_primary_fixed", "onprimaryfixed"),
+        ("on_primary_fixed_variant", "onprimaryfixedvariant"),
+        ("secondary", "secondary"),
+        ("on_secondary", "onsecondary"),
+        ("secondary_container", "secondarycontainer"),
+        ("on_secondary_container", "onsecondarycontainer"),
+        ("secondary_fixed", "secondaryfixed"),
+        ("secondary_fixed_dim", "secondaryfixeddim"),
+        ("on_secondary_fixed", "onsecondaryfixed"),
+        ("on_secondary_fixed_variant", "onsecondaryfixedvariant"),
+        ("tertiary", "tertiary"),
+        ("on_tertiary", "ontertiary"),
+        ("tertiary_container", "tertiarycontainer"),
+        ("on_tertiary_container", "ontertiarycontainer"),
+        ("tertiary_fixed", "tertiaryfixed"),
+        ("tertiary_fixed_dim", "tertiaryfixeddim"),
+        ("on_tertiary_fixed", "ontertiaryfixed"),
+        ("on_tertiary_fixed_variant", "ontertiaryfixedvariant"),
+        ("error", "error"),
+        ("on_error", "onerror"),
+        ("error_container", "errorcontainer"),
+        ("on_error_container", "onerrorcontainer"),
+        ("surface_dim", "surfacedim"),
+        ("surface", "surface"),
+        ("surface_tint", "surfacetint"),
+        ("surface_bright", "surfacebright"),
+        ("surface_container_lowest", "surfacecontainerlowest"),
+        ("surface_container_low", "surfacecontainerlow"),
+        ("surface_container", "surfacecontainer"),
+        ("surface_container_high", "surfacecontainerhigh"),
+        ("surface_container_highest", "surfacecontainerhighest"),
+        ("on_surface", "onsurface"),
+        ("on_surface_variant", "onsurfacevariant"),
+        ("outline", "outline"),
+        ("outline_variant", "outlinevariant"),
+        ("inverse_surface", "inversesurface"),
+        ("inverse_on_surface", "inverseonsurface"),
+        ("surface_variant", "surfacevariant"),
+        ("background", "background"),
+        ("on_background", "onbackground"),
+        ("shadow", "shadow"),
+        ("scrim", "scrim"),
+        ("hover", "hover"),
+        ("on_hover", "onhover"),
     ];
 
-    for key in flat_keys {
-        if let Some(val) = scheme.get(*key) {
-            let hex = val.as_str().unwrap_or("");
-            map.insert(format!("colors.{key}.default.hex"), hex.to_string());
-            map.insert(format!("colors.{key}.hex"), hex.to_string());
-            map.insert(format!("colors.{key}"), hex.to_string());
-        }
-    }
-
-    let camel_to_snake: &[(&str, &str)] = &[
-        ("onprimary", "on_primary"),
-        ("primarycontainer", "primary_container"),
-        ("onprimarycontainer", "on_primary_container"),
-        ("inverseprimary", "inverse_primary"),
-        ("primaryfixed", "primary_fixed"),
-        ("primaryfixeddim", "primary_fixed_dim"),
-        ("onprimaryfixed", "on_primary_fixed"),
-        ("onprimaryfixedvariant", "on_primary_fixed_variant"),
-        ("onsecondary", "on_secondary"),
-        ("secondarycontainer", "secondary_container"),
-        ("onsecondarycontainer", "on_secondary_container"),
-        ("secondaryfixed", "secondary_fixed"),
-        ("secondaryfixeddim", "secondary_fixed_dim"),
-        ("onsecondaryfixed", "on_secondary_fixed"),
-        ("onsecondaryfixedvariant", "on_secondary_fixed_variant"),
-        ("ontertiary", "on_tertiary"),
-        ("tertiarycontainer", "tertiary_container"),
-        ("ontertiarycontainer", "on_tertiary_container"),
-        ("tertiaryfixed", "tertiary_fixed"),
-        ("tertiaryfixeddim", "tertiary_fixed_dim"),
-        ("ontertiaryfixed", "on_tertiary_fixed"),
-        ("ontertiaryfixedvariant", "on_tertiary_fixed_variant"),
-        ("onerror", "on_error"),
-        ("errorcontainer", "error_container"),
-        ("onerrorcontainer", "on_error_container"),
-        ("surfacedim", "surface_dim"),
-        ("surfacetint", "surface_tint"),
-        ("surfacebright", "surface_bright"),
-        ("surfacecontainerlowest", "surface_container_lowest"),
-        ("surfacecontainerlow", "surface_container_low"),
-        ("surfacecontainerhigh", "surface_container_high"),
-        ("surfacecontainerhighest", "surface_container_highest"),
-        ("onsurfacevariant", "on_surface_variant"),
-        ("outlinevariant", "outline_variant"),
-        ("inversesurface", "inverse_surface"),
-        ("inverseonsurface", "inverse_on_surface"),
-        ("surfacevariant", "surface_variant"),
-        ("onbackground", "on_background"),
-        ("onhover", "on_hover"),
-    ];
-
-    for &(camel, snake) in camel_to_snake {
-        if let Some(val) = scheme.get(camel) {
-            let hex = val.as_str().unwrap_or("");
+    for &(snake, camel) in color_keys {
+        let val = scheme.get(snake).or_else(|| scheme.get(camel));
+        if let Some(v) = val {
+            let hex = v.as_str().unwrap_or("");
             map.insert(format!("colors.{snake}.default.hex"), hex.to_string());
             map.insert(format!("colors.{snake}.hex"), hex.to_string());
             map.insert(format!("colors.{snake}"), hex.to_string());
@@ -539,31 +499,22 @@ fn build_color_map_from_json(scheme: &serde_json::Value) -> HashMap<String, Stri
             }
         }
 
-        for key in &[
-            "foreground",
-            "background",
-            "selectionfg",
-            "selectionbg",
-            "cursortext",
-            "cursor",
-        ] {
-            if let Some(val) = terminal.get(*key) {
-                let hex = val.as_str().unwrap_or("");
-                map.insert(format!("terminal.{key}"), hex.to_string());
-                map.insert(format!("colors.terminal.{key}"), hex.to_string());
-            }
-        }
-
-        let terminal_aliases: &[(&str, &str)] = &[
-            ("selectionfg", "selectionFg"),
-            ("selectionbg", "selectionBg"),
-            ("cursortext", "cursorText"),
+        let terminal_keys: &[(&str, &[&str])] = &[
+            ("foreground", &["foreground"]),
+            ("background", &["background"]),
+            ("selectionFg", &["selectionFg", "selectionfg"]),
+            ("selectionBg", &["selectionBg", "selectionbg"]),
+            ("cursorText", &["cursorText", "cursortext"]),
+            ("cursor", &["cursor"]),
         ];
-        for &(lower, camel) in terminal_aliases {
-            if let Some(val) = terminal.get(lower) {
-                let hex = val.as_str().unwrap_or("");
-                map.insert(format!("terminal.{camel}"), hex.to_string());
-                map.insert(format!("colors.terminal.{camel}"), hex.to_string());
+
+        for &(camel_name, aliases) in terminal_keys {
+            for alias in aliases {
+                if let Some(val) = terminal.get(*alias) {
+                    let hex = val.as_str().unwrap_or("");
+                    map.insert(format!("terminal.{camel_name}"), hex.to_string());
+                    map.insert(format!("colors.terminal.{camel_name}"), hex.to_string());
+                }
             }
         }
     }
