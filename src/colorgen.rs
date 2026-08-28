@@ -53,6 +53,10 @@ mod colorgen {
     impl cxx_qt::Constructor<()> for ColorGen {}
 }
 
+impl cxx_qt::Initialize for colorgen::ColorGen {
+    fn initialize(self: Pin<&mut Self>) {}
+}
+
 pub struct ColorGenRust {
     pub is_running: bool,
     pub is_dark_mode: bool,
@@ -66,16 +70,16 @@ impl Default for ColorGenRust {
         let mut variant_types = QStringList::default();
         for name in &[
             "content",
-            "tonal_spot",
+            "tonalspot",
             "monochrome",
             "neutral",
             "vibrant",
             "expressive",
             "fidelity",
             "rainbow",
-            "fruit_salad",
+            "fruitsalad",
         ] {
-            variant_types.push(QString::from(*name));
+            variant_types.append(QString::from(*name));
         }
 
         Self {

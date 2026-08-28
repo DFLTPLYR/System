@@ -269,8 +269,20 @@ Component.onCompleted: Widgets.set_property(obj, "size", 20)
 
 ## Building
 
+### Prerequisites
+
+A Nix flake dev shell is provided with all required dependencies (Qt, Rust, CMake, Wayland, etc.):
+
 ```sh
-just build   # cargo build --release and installs the plugin to ~/.local/share/qt6/qml/System
+nix develop    # enter the dev shell
+just build     # cargo build --release and install to ~/.local/share/qt6/qml/System
+```
+
+### Manual
+
+```sh
+cargo build --release
+just build
 ```
 
 ## Notes
@@ -279,3 +291,7 @@ just build   # cargo build --release and installs the plugin to ~/.local/share/q
   results back — properties are reactive, so bind to them.
 - Plugin is loaded into the host QML process; its own footprint is ~1.6 MiB
   resident and ~0% CPU when idle.
+
+## Credits
+
+- [matugen](https://github.com/InioX/matugen) — Material You color generation used by `System.Colorscheme`
