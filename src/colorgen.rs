@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use cxx_qt_lib::{QString, QStringList};
 use material_colors::{
@@ -118,6 +119,8 @@ impl colorgen::ColorGen {
             }
         }
 
+        let _ = fs::remove_file(&image_path);
+
         let payload = serde_json::json!({
             "light": scheme_json(&theme.schemes.light),
             "dark": scheme_json(&theme.schemes.dark),
@@ -148,8 +151,9 @@ impl colorgen::ColorGen {
             Err(e) => {
                 let preview: String = trimmed.chars().take(50).collect();
                 self.as_mut().set_is_running(false);
-                self.as_mut()
-                    .error(QString::from(format!("invalid JSON: {e} | preview: {preview}")));
+                self.as_mut().error(QString::from(format!(
+                    "invalid JSON: {e} | preview: {preview}"
+                )));
                 self.as_mut().output(QString::default());
                 return;
             }
@@ -164,8 +168,10 @@ impl colorgen::ColorGen {
             Some(s) => s,
             None => {
                 self.as_mut().set_is_running(false);
-                self.as_mut()
-                    .error(QString::from(format!("missing \"{mode_key}\" key in JSON")));
+                self.as_mut().error(QString::from(format!(
+                    "missing \"{mode_key}\" key in JSON | keys: {:?}",
+                    value.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                )));
                 self.as_mut().output(QString::default());
                 return;
             }
@@ -407,9 +413,18 @@ fn build_color_map(scheme: &Scheme, is_dark: bool, image: &str) -> HashMap<Strin
     );
 
     map.insert("hover".to_string(), scheme.tertiary.to_hex_with_pound());
-    map.insert("colors.hover".to_string(), scheme.tertiary.to_hex_with_pound());
-    map.insert("on_hover".to_string(), scheme.on_tertiary.to_hex_with_pound());
-    map.insert("colors.on_hover".to_string(), scheme.on_tertiary.to_hex_with_pound());
+    map.insert(
+        "colors.hover".to_string(),
+        scheme.tertiary.to_hex_with_pound(),
+    );
+    map.insert(
+        "on_hover".to_string(),
+        scheme.on_tertiary.to_hex_with_pound(),
+    );
+    map.insert(
+        "colors.on_hover".to_string(),
+        scheme.on_tertiary.to_hex_with_pound(),
+    );
 
     map
 }
@@ -522,16 +537,19 @@ fn build_color_map_from_json(scheme: &serde_json::Value) -> HashMap<String, Stri
     map
 }
 
+static TEMPLATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*(.+?)\s*\}\}").unwrap());
+
 fn render_template(content: &str, variables: &HashMap<String, String>) -> String {
-    let re = Regex::new(r"\{\{\s*(.+?)\s*\}\}").unwrap();
-    re.replace_all(content, |caps: &regex::Captures| {
-        let expr = caps[1].trim();
-        variables
-            .get(expr)
-            .cloned()
-            .unwrap_or_else(|| caps[0].to_string())
-    })
-    .to_string()
+    TEMPLATE_RE
+        .replace_all(content, |caps: &regex::Captures| {
+            let expr = caps[1].trim();
+            variables
+                .get(expr)
+                .cloned()
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .to_string()
 }
 
 fn run_hook(hook: &str, variables: &HashMap<String, String>) -> bool {
