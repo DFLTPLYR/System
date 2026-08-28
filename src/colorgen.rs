@@ -33,13 +33,17 @@ mod colorgen {
         #[qproperty(bool, is_running)]
         #[qproperty(bool, is_dark_mode)]
         #[qproperty(QString, config_path)]
+        #[qproperty(QString, variant)]
         type ColorGen = super::ColorGenRust;
 
         #[qinvokable]
-        fn generate(self: Pin<&mut Self>, paths: &QStringList, type_: QString);
+        fn generate(self: Pin<&mut Self>, paths: &QStringList);
 
         #[qinvokable]
         fn change_theme(self: Pin<&mut Self>, json: QString);
+
+        #[qinvokable]
+        fn variant_types(self: Pin<&Self>) -> QStringList;
 
         #[qsignal]
         fn output(self: Pin<&mut Self>, theme_json: QString);
@@ -55,6 +59,7 @@ pub struct ColorGenRust {
     pub is_running: bool,
     pub is_dark_mode: bool,
     pub config_path: QString,
+    pub variant: QString,
 }
 
 impl Default for ColorGenRust {
@@ -63,12 +68,13 @@ impl Default for ColorGenRust {
             is_running: false,
             is_dark_mode: true,
             config_path: QString::default(),
+            variant: QString::from("content"),
         }
     }
 }
 
 impl colorgen::ColorGen {
-    fn generate(mut self: Pin<&mut Self>, paths: &QStringList, _type_: QString) {
+    fn generate(mut self: Pin<&mut Self>, paths: &QStringList) {
         self.as_mut().set_is_running(true);
         let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
         let is_dark = *self.is_dark_mode();
@@ -100,7 +106,7 @@ impl colorgen::ColorGen {
         let mut data = ImageReader::read(bytes).expect("failed to read image");
         data.resize(128, 128, FilterType::Lanczos3);
 
-        let variant = match _type_.to_string().to_lowercase().as_str() {
+        let variant = match self.variant().to_string().to_lowercase().as_str() {
             "monochrome" => Variant::Monochrome,
             "neutral" => Variant::Neutral,
             "vibrant" => Variant::Vibrant,
@@ -202,6 +208,24 @@ impl colorgen::ColorGen {
 
         self.as_mut().set_is_running(false);
         self.as_mut().output(json);
+    }
+
+    fn variant_types(self: Pin<&Self>) -> QStringList {
+        let mut list = QStringList::default();
+        for name in &[
+            "content",
+            "tonal_spot",
+            "monochrome",
+            "neutral",
+            "vibrant",
+            "expressive",
+            "fidelity",
+            "rainbow",
+            "fruit_salad",
+        ] {
+            list.push(QString::from(*name));
+        }
+        list
     }
 }
 
