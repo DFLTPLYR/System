@@ -34,6 +34,7 @@ mod colorgen {
         #[qproperty(bool, is_dark_mode)]
         #[qproperty(QString, config_path)]
         #[qproperty(QString, variant)]
+        #[qproperty(QStringList, variant_types)]
         type ColorGen = super::ColorGenRust;
 
         #[qinvokable]
@@ -41,9 +42,6 @@ mod colorgen {
 
         #[qinvokable]
         fn change_theme(self: Pin<&mut Self>, json: QString);
-
-        #[qinvokable]
-        fn variant_types(self: Pin<&Self>) -> QStringList;
 
         #[qsignal]
         fn output(self: Pin<&mut Self>, theme_json: QString);
@@ -60,15 +58,32 @@ pub struct ColorGenRust {
     pub is_dark_mode: bool,
     pub config_path: QString,
     pub variant: QString,
+    pub variant_types: QStringList,
 }
 
 impl Default for ColorGenRust {
     fn default() -> Self {
+        let mut variant_types = QStringList::default();
+        for name in &[
+            "content",
+            "tonal_spot",
+            "monochrome",
+            "neutral",
+            "vibrant",
+            "expressive",
+            "fidelity",
+            "rainbow",
+            "fruit_salad",
+        ] {
+            variant_types.push(QString::from(*name));
+        }
+
         Self {
             is_running: false,
             is_dark_mode: true,
             config_path: QString::default(),
             variant: QString::from("content"),
+            variant_types,
         }
     }
 }
@@ -208,24 +223,6 @@ impl colorgen::ColorGen {
 
         self.as_mut().set_is_running(false);
         self.as_mut().output(json);
-    }
-
-    fn variant_types(self: Pin<&Self>) -> QStringList {
-        let mut list = QStringList::default();
-        for name in &[
-            "content",
-            "tonal_spot",
-            "monochrome",
-            "neutral",
-            "vibrant",
-            "expressive",
-            "fidelity",
-            "rainbow",
-            "fruit_salad",
-        ] {
-            list.push(QString::from(*name));
-        }
-        list
     }
 }
 
