@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use cxx_qt_lib::{QString, QStringList};
 use material_colors::{
     color::Argb,
+    dynamic_color::Variant,
     image::{FilterType, ImageReader},
     scheme::Scheme,
     theme::ThemeBuilder,
@@ -66,10 +67,6 @@ impl Default for ColorGenRust {
     }
 }
 
-impl cxx_qt::Initialize for colorgen::ColorGen {
-    fn initialize(self: Pin<&mut Self>) {}
-}
-
 impl colorgen::ColorGen {
     fn generate(mut self: Pin<&mut Self>, paths: &QStringList, _type_: QString) {
         self.as_mut().set_is_running(true);
@@ -102,7 +99,22 @@ impl colorgen::ColorGen {
 
         let mut data = ImageReader::read(bytes).expect("failed to read image");
         data.resize(128, 128, FilterType::Lanczos3);
-        let theme = ThemeBuilder::with_source(ImageReader::extract_color(&data)).build();
+
+        let variant = match _type_.to_string().to_lowercase().as_str() {
+            "monochrome" => Variant::Monochrome,
+            "neutral" => Variant::Neutral,
+            "vibrant" => Variant::Vibrant,
+            "expressive" => Variant::Expressive,
+            "fidelity" => Variant::Fidelity,
+            "content" => Variant::Content,
+            "rainbow" => Variant::Rainbow,
+            "fruit_salad" | "fruitsalad" => Variant::FruitSalad,
+            _ => Variant::TonalSpot,
+        };
+
+        let theme = ThemeBuilder::with_source(ImageReader::extract_color(&data))
+            .variant(variant)
+            .build();
 
         let scheme = if is_dark {
             &theme.schemes.dark
@@ -537,8 +549,7 @@ fn build_color_map_from_json(scheme: &serde_json::Value) -> HashMap<String, Stri
     map
 }
 
-static TEMPLATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{\s*(.+?)\s*\}\}").unwrap());
+static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*(.+?)\s*\}\}").unwrap());
 
 fn render_template(content: &str, variables: &HashMap<String, String>) -> String {
     TEMPLATE_RE
