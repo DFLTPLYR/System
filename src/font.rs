@@ -1,4 +1,6 @@
+use std::fs;
 use std::pin::Pin;
+use std::process::Command;
 use std::thread;
 
 use cxx_qt::Threading;
@@ -34,6 +36,15 @@ mod font {
 
         #[qinvokable]
         fn refresh(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn change_sans_serif(self: Pin<&mut Self>, preferred: QString, mono: bool);
+
+        #[qinvokable]
+        fn change_mono(self: Pin<&mut Self>, preferred: QString);
+
+        #[qinvokable]
+        fn change_serif(self: Pin<&mut Self>, preferred: QString, mono: bool);
     }
 
     impl cxx_qt::Constructor<()> for SysFont {}
@@ -68,7 +79,38 @@ impl font::SysFont {
             font::system_font_families(&mut families);
 
             let mut tree = serde_json::Map::new();
+            let mut list = QList::<QString>::default();
+
+            let mono_keywords = [
+                "mono", "code", "console", "terminal", "courier", "proggy",
+                "dejavu sans mono", "liberation mono", "noto sans mono",
+                "fira code", "iosevka", "jetbrains",
+            ];
+            let serif_keywords = [
+                "serif", "noto serif", "dejavu serif", "liberation serif",
+                "tex gyre pagella", "tex gyre schola", "tex gyre termes",
+            ];
+
             for family in families.iter() {
+                let family_lower = family.to_string().to_lowercase();
+
+                let category = if mono_keywords.iter().any(|k| family_lower.contains(k)) {
+                    "monospace"
+                } else if serif_keywords.iter().any(|k| family_lower.contains(k)) {
+                    "serif"
+                } else {
+                    "sans-serif"
+                };
+
+                let is_mono = mono_keywords.iter().any(|k| family_lower.contains(k));
+
+                let obj = serde_json::json!({
+                    "family": category,
+                    "name": family.to_string(),
+                    "mono": is_mono
+                });
+                list.append(QString::from(&obj.to_string()));
+
                 let mut styles_json = serde_json::Map::new();
                 let mut styles = QStringList::default();
                 font::system_font_styles(family, &mut styles);
@@ -84,11 +126,67 @@ impl font::SysFont {
             }
 
             let json = serde_json::Value::Object(tree).to_string();
-            let list: QList<QString> = (&families).into();
             let _ = qt_thread.queue(move |mut this| {
                 let _ = this.as_mut().set_list(list);
                 let _ = this.as_mut().set_families_json(QString::from(&json));
             });
         });
+    }
+
+    fn change_sans_serif(self: Pin<&mut Self>, preferred: QString, mono: bool) {
+        Self::write_fontconfig("sans-serif", &preferred.to_string(), mono);
+    }
+
+    fn change_mono(self: Pin<&mut Self>, preferred: QString) {
+        Self::write_fontconfig("monospace", &preferred.to_string(), false);
+    }
+
+    fn change_serif(self: Pin<&mut Self>, preferred: QString, mono: bool) {
+        Self::write_fontconfig("serif", &preferred.to_string(), mono);
+    }
+
+    fn write_fontconfig(family: &str, preferred: &str, mono: bool) {
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("Could not determine home directory");
+            return;
+        };
+
+        let fontconfig_dir = home.join(".config").join("fontconfig");
+        if fs::create_dir_all(&fontconfig_dir).is_err() {
+            eprintln!("Failed to create fontconfig directory");
+            return;
+        }
+
+        let conf_path = fontconfig_dir.join("fonts.conf");
+
+        let mono_alias = if mono {
+            format!(
+                r#"
+  <alias>
+    <family>monospace</family>
+    <prefer><family>{preferred}</family></prefer>
+  </alias>"#
+            )
+        } else {
+            String::new()
+        };
+
+        let conf_content = format!(
+            r#"<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <alias>
+    <family>{family}</family>
+    <prefer><family>{preferred}</family></prefer>
+  </alias>{mono_alias}
+</fontconfig>"#
+        );
+
+        if fs::write(&conf_path, conf_content).is_err() {
+            eprintln!("Failed to write fonts.conf");
+            return;
+        }
+
+        let _ = Command::new("fc-cache").args(["-fv"]).status();
     }
 }
