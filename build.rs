@@ -17,7 +17,6 @@ fn main() {
     );
 
     CxxQtBuilder::new_qml_module(QmlModule::new("System").plugin_type(PluginType::Dynamic))
-        .file("src/colorscheme.rs")
         .file("src/colorgen.rs")
         .file("src/filemanager.rs")
         .file("src/font.rs")

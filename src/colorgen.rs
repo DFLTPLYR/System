@@ -741,22 +741,39 @@ fn scheme_json(s: &Scheme) -> serde_json::Value {
 
 fn combine_wallpaper(paths: Vec<String>) -> Option<String> {
     let output = "/tmp/combined_wallpaper.png".to_string();
-    let mut cmd = Command::new("magick");
-    for path in paths {
-        let local_path = if let Some(stripped) = path.strip_prefix("file://") {
-            stripped
-        } else {
-            &path
-        };
-        cmd.arg("(")
-            .arg(local_path)
-            .arg("-resize")
-            .arg("960x1080!")
-            .arg(")");
+    let local_paths: Vec<&str> = paths
+        .iter()
+        .map(|p| {
+            if let Some(stripped) = p.strip_prefix("file://") {
+                stripped
+            } else {
+                p
+            }
+        })
+        .collect();
+
+    let mut images: Vec<image::DynamicImage> = Vec::new();
+    for path in &local_paths {
+        images.push(image::open(path).ok()?);
     }
-    cmd.arg("+append").arg(&output);
-    match cmd.status() {
-        Ok(status) if status.success() => Some(output),
-        _ => None,
+
+    if images.is_empty() {
+        return None;
     }
+
+    let resized: Vec<image::DynamicImage> = images
+        .into_iter()
+        .map(|img| img.resize_exact(960, 1080, image::imageops::FilterType::Lanczos3))
+        .collect();
+
+    let total_width = 960 * resized.len() as u32;
+    let height = 1080;
+    let mut combined = image::RgbImage::new(total_width, height);
+
+    for (i, img) in resized.iter().enumerate() {
+        image::imageops::overlay(&mut combined, &img.to_rgb8(), ((i as u32) * 960).into(), 0);
+    }
+
+    combined.save(&output).ok()?;
+    Some(output)
 }
