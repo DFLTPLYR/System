@@ -31,7 +31,6 @@ mod font {
         #[qml_element]
         #[qml_singleton]
         #[qproperty(QList_QString, list)]
-        #[qproperty(QString, families_json)]
         type SysFont = super::FontRust;
 
         #[qinvokable]
@@ -53,14 +52,12 @@ mod font {
 
 pub struct FontRust {
     pub list: QList<QString>,
-    pub families_json: QString,
 }
 
 impl Default for FontRust {
     fn default() -> Self {
         Self {
             list: QList::<QString>::default(),
-            families_json: QString::default(),
         }
     }
 }
@@ -82,13 +79,27 @@ impl font::SysFont {
             let mut list = QList::<QString>::default();
 
             let mono_keywords = [
-                "mono", "code", "console", "terminal", "courier", "proggy",
-                "dejavu sans mono", "liberation mono", "noto sans mono",
-                "fira code", "iosevka", "jetbrains",
+                "mono",
+                "code",
+                "console",
+                "terminal",
+                "courier",
+                "proggy",
+                "dejavu sans mono",
+                "liberation mono",
+                "noto sans mono",
+                "fira code",
+                "iosevka",
+                "jetbrains",
             ];
             let serif_keywords = [
-                "serif", "noto serif", "dejavu serif", "liberation serif",
-                "tex gyre pagella", "tex gyre schola", "tex gyre termes",
+                "serif",
+                "noto serif",
+                "dejavu serif",
+                "liberation serif",
+                "tex gyre pagella",
+                "tex gyre schola",
+                "tex gyre termes",
             ];
 
             for family in families.iter() {
@@ -125,10 +136,8 @@ impl font::SysFont {
                 tree.insert(family.to_string(), serde_json::Value::Object(styles_json));
             }
 
-            let json = serde_json::Value::Object(tree).to_string();
             let _ = qt_thread.queue(move |mut this| {
                 let _ = this.as_mut().set_list(list);
-                let _ = this.as_mut().set_families_json(QString::from(&json));
             });
         });
     }
