@@ -83,6 +83,7 @@ Lists fonts available on the system via Qt's `QFontDatabase`.
 | --- | --- | --- |
 | `list` | list\<string\> | All font family names |
 | `families_json` | string | JSON object: `family -> style -> [sizes]` (smooth point sizes) |
+| `current` | string | The system's current default font family name |
 
 ### Functions
 

@@ -23,6 +23,8 @@ mod font {
         fn system_font_families(families: &mut QStringList);
         fn system_font_styles(family: &QString, styles: &mut QStringList);
         fn system_font_sizes(family: &QString, style: &QString, sizes: &mut QList_i32);
+        fn system_default_font(family: &mut QString);
+        fn system_set_application_font(family: &QString, pointSize: i32);
     }
 
     #[auto_cxx_name]
@@ -31,19 +33,16 @@ mod font {
         #[qml_element]
         #[qml_singleton]
         #[qproperty(QList_QString, list)]
+        #[qproperty(QString, current)]
+        #[qproperty(QString, app_font_family)]
+        #[qproperty(i32, app_font_size)]
         type SysFont = super::FontRust;
 
         #[qinvokable]
         fn refresh(self: Pin<&mut Self>);
 
         #[qinvokable]
-        fn change_sans_serif(self: Pin<&mut Self>, preferred: QString, mono: bool);
-
-        #[qinvokable]
-        fn change_mono(self: Pin<&mut Self>, preferred: QString);
-
-        #[qinvokable]
-        fn change_serif(self: Pin<&mut Self>, preferred: QString, mono: bool);
+        fn apply(self: Pin<&mut Self>, family: QString, pointSize: i32, category: QString);
     }
 
     impl cxx_qt::Constructor<()> for SysFont {}
@@ -52,12 +51,18 @@ mod font {
 
 pub struct FontRust {
     pub list: QList<QString>,
+    pub current: QString,
+    pub app_font_family: QString,
+    pub app_font_size: i32,
 }
 
 impl Default for FontRust {
     fn default() -> Self {
         Self {
             list: QList::<QString>::default(),
+            current: QString::default(),
+            app_font_family: QString::default(),
+            app_font_size: 12,
         }
     }
 }
@@ -137,61 +142,86 @@ impl font::SysFont {
             }
 
             let _ = qt_thread.queue(move |mut this| {
+                let mut default_family = QString::default();
+                font::system_default_font(&mut default_family);
+                let _ = this.as_mut().set_current(default_family);
                 let _ = this.as_mut().set_list(list);
             });
         });
     }
 
-    fn change_sans_serif(self: Pin<&mut Self>, preferred: QString, mono: bool) {
-        Self::write_fontconfig("sans-serif", &preferred.to_string(), mono);
+    fn apply(mut self: Pin<&mut Self>, family: QString, point_size: i32, category: QString) {
+        let category_str = category.to_string();
+        let family_str = family.to_string();
+
+        match category_str.as_str() {
+            "monospace" => Self::update_fontconfig_alias("monospace", &family_str),
+            "serif" => Self::update_fontconfig_alias("serif", &family_str),
+            _ => Self::update_fontconfig_alias("sans-serif", &family_str),
+        }
+
+        font::system_set_application_font(&family, point_size);
+        let _ = self.as_mut().set_app_font_family(family);
+        let _ = self.as_mut().set_app_font_size(point_size);
     }
 
-    fn change_mono(self: Pin<&mut Self>, preferred: QString) {
-        Self::write_fontconfig("monospace", &preferred.to_string(), false);
-    }
-
-    fn change_serif(self: Pin<&mut Self>, preferred: QString, mono: bool) {
-        Self::write_fontconfig("serif", &preferred.to_string(), mono);
-    }
-
-    fn write_fontconfig(family: &str, preferred: &str, mono: bool) {
+    fn update_fontconfig_alias(family: &str, preferred: &str) {
         let Some(home) = dirs::home_dir() else {
             eprintln!("Could not determine home directory");
             return;
         };
 
         let fontconfig_dir = home.join(".config").join("fontconfig");
+        let conf_path = fontconfig_dir.join("fonts.conf");
+
+        let new_alias = format!(
+            r#" <alias>
+                    <family>{family}</family>
+                    <prefer><family>{preferred}</family></prefer>
+                </alias>"#
+        );
+
+        let content = fs::read_to_string(&conf_path).unwrap_or_default();
+
+        let family_tag = format!("    <family>{family}</family>");
+        let new_content = if let Some(start) = content.find(&family_tag) {
+            let alias_open = content[..start].rfind("<alias>").unwrap_or(0);
+            let alias_close = content[start..]
+                .find("</alias>")
+                .map(|i| start + i + 8)
+                .unwrap_or(content.len());
+            let mut result = content[..alias_open].to_string();
+            result.push_str(&new_alias);
+            result.push_str(&content[alias_close..]);
+            result
+        } else if content.contains("</fontconfig>") {
+            let pos = content.rfind("</fontconfig>").unwrap();
+            let mut result = content[..pos].to_string();
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&new_alias);
+            result.push('\n');
+            result.push_str(&content[pos..]);
+            result
+        } else if content.is_empty() {
+            format!(
+                r#" <?xml version="1.0"?>
+                        <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+                        <fontconfig>
+                        {new_alias}
+                    </fontconfig>"#
+            )
+        } else {
+            content
+        };
+
         if fs::create_dir_all(&fontconfig_dir).is_err() {
             eprintln!("Failed to create fontconfig directory");
             return;
         }
 
-        let conf_path = fontconfig_dir.join("fonts.conf");
-
-        let mono_alias = if mono {
-            format!(
-                r#"
-  <alias>
-    <family>monospace</family>
-    <prefer><family>{preferred}</family></prefer>
-  </alias>"#
-            )
-        } else {
-            String::new()
-        };
-
-        let conf_content = format!(
-            r#"<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
-<fontconfig>
-  <alias>
-    <family>{family}</family>
-    <prefer><family>{preferred}</family></prefer>
-  </alias>{mono_alias}
-</fontconfig>"#
-        );
-
-        if fs::write(&conf_path, conf_content).is_err() {
+        if fs::write(&conf_path, new_content).is_err() {
             eprintln!("Failed to write fonts.conf");
             return;
         }
