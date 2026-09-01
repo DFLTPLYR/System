@@ -38,3 +38,9 @@ inline void system_set_application_font(const QString &family, int pointSize)
         font.setPointSize(pointSize);
     app->setFont(font);
 }
+
+inline bool system_font_is_monospace(const QString &family)
+{
+    QFont font(family);
+    return font.fixedPitch();
+}

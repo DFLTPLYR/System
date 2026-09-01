@@ -25,6 +25,7 @@ mod font {
         fn system_font_sizes(family: &QString, style: &QString, sizes: &mut QList_i32);
         fn system_default_font(family: &mut QString);
         fn system_set_application_font(family: &QString, pointSize: i32);
+        fn system_font_is_monospace(family: &QString) -> bool;
     }
 
     #[auto_cxx_name]
@@ -83,42 +84,10 @@ impl font::SysFont {
             let mut tree = serde_json::Map::new();
             let mut list = QList::<QString>::default();
 
-            let mono_keywords = [
-                "mono",
-                "code",
-                "console",
-                "terminal",
-                "courier",
-                "proggy",
-                "dejavu sans mono",
-                "liberation mono",
-                "noto sans mono",
-                "fira code",
-                "iosevka",
-                "jetbrains",
-            ];
-            let serif_keywords = [
-                "serif",
-                "noto serif",
-                "dejavu serif",
-                "liberation serif",
-                "tex gyre pagella",
-                "tex gyre schola",
-                "tex gyre termes",
-            ];
-
             for family in families.iter() {
-                let family_lower = family.to_string().to_lowercase();
+                let is_mono = font::system_font_is_monospace(&family);
 
-                let category = if mono_keywords.iter().any(|k| family_lower.contains(k)) {
-                    "monospace"
-                } else if serif_keywords.iter().any(|k| family_lower.contains(k)) {
-                    "serif"
-                } else {
-                    "sans-serif"
-                };
-
-                let is_mono = mono_keywords.iter().any(|k| family_lower.contains(k));
+                let category = if is_mono { "monospace" } else { "sans-serif" };
 
                 let obj = serde_json::json!({
                     "family": category,
