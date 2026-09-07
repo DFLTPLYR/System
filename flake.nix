@@ -49,10 +49,28 @@
           cmake
           gnumake
           stdenv.cc
+          clang
+          rustPlatform.bindgenHook
           openssl
           qt.qtbase
           qt.qtdeclarative
           qt.qttools
+        ];
+
+        # System libs needed to *build* pinray -> pipewire/libspa-sys
+        # (libpipewire-0.3.pc, libspa-0.2.pc) + X11/Wayland link deps.
+        buildInputs = with pkgs; [
+          pipewire
+          wayland
+          libdrm
+          mesa
+          dbus
+          ffmpeg
+          xorg.libX11
+          xorg.libXrandr
+          xorg.libXfixes
+          xorg.libXext
+          libxkbcommon
         ];
 
         shellHook = ''

@@ -27,6 +27,7 @@ regex = "1"
 rayon = "1.10"
 image = "0.25"
 dirs = "6"
+pinray = "0.2.4"
 
 [build-dependencies]
 cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"] }

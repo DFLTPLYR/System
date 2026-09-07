@@ -20,6 +20,7 @@ fn main() {
         .file("src/colorgen.rs")
         .file("src/filemanager.rs")
         .file("src/font.rs")
+        .file("src/recorder.rs")
         .file("src/hardware.rs")
         .file("src/notification.rs")
         .file("src/weather.rs")
