@@ -214,6 +214,79 @@ fn default_videos_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp")
 }
 
+// --- helpers to fix long-running hang ---
+
+fn clamp_history_params(time: u64, fps: u64) -> (u64, u64) {
+    // Bound memory: wl-screenrec --history keeps last N seconds at 5 MB/s default.
+    // 60s*5MB ~300MB is already large for tmpfs. Clamp to prevent OOM on misconfig.
+    (time.clamp(5, 60), fps.clamp(1, 60))
+}
+
+fn cleanup_old_history_files(dir: &Path) {
+    // Remove stale wl-screenrec-history-*.mp4 left by crashes. Otherwise XDG_RUNTIME_DIR
+    // (tmpfs) fills and the compositor hangs.
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("wl-screenrec-history-") || !name.ends_with(".mp4") {
+            continue;
+        }
+        // remove files older than 1h or empty stale files
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    if elapsed > Duration::from_secs(3600) {
+                        let _ = std::fs::remove_file(entry.path());
+                        eprintln!("cleanup: removed stale {}", entry.path().display());
+                    }
+                }
+            }
+            // also remove 0-byte files left if process never flushed
+            if meta.len() == 0 {
+                // keep very recent empty file (just created) - only delete if >5min old
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(elapsed) = modified.elapsed() {
+                        if elapsed > Duration::from_secs(300) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_stderr_collector(
+    stderr: Option<std::process::ChildStderr>,
+    buf: Arc<Mutex<String>>,
+) {
+    // Drain stderr concurrently with bounded buffer to avoid pipe fill deadlock.
+    // Previous code did `cmd.stderr(piped)` but only read after `wait()` -> 64KB pipe fills,
+    // child blocks on write, Wayland screencopy backpressures compositor -> PC hang.
+    thread::spawn(move || {
+        if let Some(mut f) = stderr {
+            let mut tmp = [0u8; 4096];
+            loop {
+                match f.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&tmp[..n]);
+                        let mut g = buf.lock().unwrap();
+                        g.push_str(&chunk);
+                        const MAX: usize = 8192;
+                        if g.len() > MAX {
+                            let excess = g.len() - MAX;
+                            g.drain(..excess);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
 fn spawn_replay_process(
     qt_thread: cxx_qt::CxxQtThread<screen_record::ScreenRec>,
     time: u64,
@@ -224,12 +297,22 @@ fn spawn_replay_process(
         return;
     }
 
+    let (orig_time, orig_fps) = (time, fps);
+    let (time, fps) = clamp_history_params(time, fps);
+    if time != orig_time || fps != orig_fps {
+        eprintln!(
+            "spawn_replay: clamped time {}->{} fps {}->{} to prevent OOM",
+            orig_time, time, orig_fps, fps
+        );
+    }
+
     // History buffer lives in temp (not $HOME/Videos) – only on clip we copy to Videos.
     // This avoids overwriting Videos on every clip and keeps buffer file hidden.
     let temp_dir = std::env::var("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
     let _ = std::fs::create_dir_all(&temp_dir);
+    cleanup_old_history_files(&temp_dir);
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let out_path = temp_dir.join(format!("wl-screenrec-history-{timestamp}.mp4"));
 
@@ -274,7 +357,10 @@ fn spawn_replay_process(
     };
 
     let pid = child.id();
-    let mut stderr = child.stderr.take();
+    let stderr = child.stderr.take();
+    let err_buf = Arc::new(Mutex::new(String::new()));
+    spawn_stderr_collector(stderr, err_buf.clone());
+
     let child_arc = Arc::new(Mutex::new(child));
     // Clone path for storage and for logging
     let stored_path = out_path.clone();
@@ -299,24 +385,23 @@ fn spawn_replay_process(
 
     let qt_thread_clone = qt_thread.clone();
     thread::spawn(move || {
-        let (status, err_buf) = {
-            let mut guard = match child_arc.lock() {
+        // Poll wait without holding lock continuously. Previous code held lock for entire
+        // lifetime via `guard.wait()`, so `stop_replay_process`/`clip` try_lock always failed
+        // and fallback `ch.kill()` never ran.
+        let status = loop {
+            thread::sleep(Duration::from_millis(200));
+            let mut guard = match child_arc.try_lock() {
                 Ok(g) => g,
-                Err(_) => {
-                    let _ = qt_thread_clone.queue(move |mut q| {
-                        *replay_active().lock().unwrap() = None;
-                        q.as_mut().error(QString::from("replay lock poisoned"));
-                    });
-                    return;
-                }
+                Err(_) => continue,
             };
-            let s = guard.wait();
-            let mut buf = String::new();
-            if let Some(ref mut f) = stderr {
-                let _ = f.read_to_string(&mut buf);
+            match guard.try_wait() {
+                Ok(Some(s)) => break Ok(s),
+                Ok(None) => continue,
+                Err(e) => break Err(e),
             }
-            (s, buf)
         };
+
+        let err_buf_str = err_buf.lock().unwrap().clone();
 
         // Clear active on exit
         *replay_active().lock().unwrap() = None;
@@ -326,10 +411,10 @@ fn spawn_replay_process(
                 // normal exit, no signal needed
             }
             Ok(s) => {
-                let detail = if err_buf.trim().is_empty() {
+                let detail = if err_buf_str.trim().is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", err_buf.trim())
+                    format!(": {}", err_buf_str.trim())
                 };
                 let msg = QString::from(format!("wl-screenrec --history exited {s}{detail}"));
                 let _ = qt_thread_clone.queue(move |mut q| {
@@ -337,10 +422,10 @@ fn spawn_replay_process(
                 });
             }
             Err(e) => {
-                let detail = if err_buf.trim().is_empty() {
+                let detail = if err_buf_str.trim().is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", err_buf.trim())
+                    format!(": {}", err_buf_str.trim())
                 };
                 let msg = QString::from(format!("wait wl-screenrec --history: {e}{detail}"));
                 let _ = qt_thread_clone.queue(move |mut q| {
@@ -356,6 +441,7 @@ fn stop_replay_process(qt_thread: cxx_qt::CxxQtThread<screen_record::ScreenRec>)
     if let Some(rec) = rec {
         let pid = rec.pid;
         let child = rec.child;
+        let path = rec.path;
         // Don't block Qt thread in set_replay; spawn thread to kill
         thread::spawn(move || {
             if pid != 0 {
@@ -378,6 +464,9 @@ fn stop_replay_process(qt_thread: cxx_qt::CxxQtThread<screen_record::ScreenRec>)
                     }
                 }
             }
+            // Clean up temp file if not clipped (replay disabled). Prevent tmpfs leak.
+            let _ = std::fs::remove_file(&path);
+            eprintln!("stop_replay: cleaned {}", path.display());
         });
         let _ = qt_thread.queue(move |mut q| {
             // no is_running change for replay, just ensure UI updated if needed
@@ -475,7 +564,10 @@ impl screen_record::ScreenRec {
         };
 
         let pid = child.id();
-        let mut stderr = child.stderr.take();
+        let stderr = child.stderr.take();
+        let err_buf = Arc::new(Mutex::new(String::new()));
+        spawn_stderr_collector(stderr, err_buf.clone());
+
         let child_arc = Arc::new(Mutex::new(child));
         let stop = Arc::new(AtomicBool::new(false));
         *active().lock().unwrap() = Some(ActiveRecording {
@@ -485,25 +577,19 @@ impl screen_record::ScreenRec {
         });
 
         thread::spawn(move || {
-            let (status, err_buf) = {
-                let mut guard = match child_arc.lock() {
+            let status = loop {
+                thread::sleep(Duration::from_millis(200));
+                let mut guard = match child_arc.try_lock() {
                     Ok(g) => g,
-                    Err(_) => {
-                        let _ = qt_thread.queue(move |mut q| {
-                            *active().lock().unwrap() = None;
-                            q.as_mut().set_is_running(false);
-                            q.as_mut().error(QString::from("recording lock poisoned"));
-                        });
-                        return;
-                    }
+                    Err(_) => continue,
                 };
-                let s = guard.wait();
-                let mut buf = String::new();
-                if let Some(ref mut f) = stderr {
-                    let _ = f.read_to_string(&mut buf);
+                match guard.try_wait() {
+                    Ok(Some(s)) => break Ok(s),
+                    Ok(None) => continue,
+                    Err(e) => break Err(e),
                 }
-                (s, buf)
             };
+            let err_buf_str = err_buf.lock().unwrap().clone();
 
             match status {
                 Ok(s) if s.success() => {
@@ -523,10 +609,10 @@ impl screen_record::ScreenRec {
                             q.as_mut().finished(done);
                         });
                     } else {
-                        let detail = if err_buf.trim().is_empty() {
+                        let detail = if err_buf_str.trim().is_empty() {
                             String::new()
                         } else {
-                            format!(": {}", err_buf.trim())
+                            format!(": {}", err_buf_str.trim())
                         };
                         let msg = QString::from(format!("wl-screenrec exited {s}{detail}"));
                         let _ = qt_thread.queue(move |mut q| {
@@ -537,10 +623,10 @@ impl screen_record::ScreenRec {
                     }
                 }
                 Err(e) => {
-                    let detail = if err_buf.trim().is_empty() {
+                    let detail = if err_buf_str.trim().is_empty() {
                         String::new()
                     } else {
-                        format!(": {}", err_buf.trim())
+                        format!(": {}", err_buf_str.trim())
                     };
                     let msg = QString::from(format!("wait wl-screenrec: {e}{detail}"));
                     let _ = qt_thread.queue(move |mut q| {
@@ -707,6 +793,9 @@ impl screen_record::ScreenRec {
                                     copied,
                                     final_path.display()
                                 );
+                                // Clean up temp file to avoid tmpfs leak (was missing before)
+                                let _ = std::fs::remove_file(&path);
+                                eprintln!("clip: cleaned temp {}", path.display());
                                 // Verify with ffprobe-like check via file size
                                 QString::from(final_path.to_string_lossy().to_string())
                             }
@@ -837,6 +926,7 @@ impl screen_record::ScreenRec {
                             match std::fs::copy(&path, &final_path) {
                                 Ok(_) => {
                                     eprintln!("clip: {prog} copied to {}", final_path.display());
+                                    let _ = std::fs::remove_file(&path);
                                     QString::from(final_path.to_string_lossy().to_string())
                                 }
                                 Err(e) => {
