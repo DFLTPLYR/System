@@ -44,6 +44,56 @@ No functions or signals.
 Text { text: "CPU: " + System.Hardware.cpu_usage.toFixed(1) + "%" }
 ```
 
+## ScreenRecord — `System.ScreenRec`
+
+Screen/audio capture via [`wl-screenrec`](https://github.com/russelltg/wl-screenrec) (wlroots). Regular recording uses `wl-screenrec -f <path>` with optional `slurp` geometry selection and audio capture. Replay/history mode uses `wl-screenrec --history {time} --max-fps {fps}` started at initialization when `replay` is `true`, and `clip()` triggers `killall -USR1 wl-screenrec` to save the recent buffer.
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `is_running` | bool | `true` while a regular recording is active |
+| `audio` | bool | Capture audio (`--audio` + `--audio-device` via `pactl`/`wpctl` monitor) |
+| `display` | bool | `true` = capture output (`-o` via `slurp -o -f "%o"`), `false` = capture region (`-g` via `slurp`) |
+| `replay` | bool | Enable history/replay mode on startup |
+| `monitor` | string | Output/monitor name (used with `-o` when set) |
+| `fps` | int | Max FPS (`--max-fps`) for both regular and history mode |
+| `time` | int | History length in seconds (`--history`) for replay mode (default `30`) |
+
+### Functions
+
+| Function | Arguments | Description |
+| --- | --- | --- |
+| `start(path)` | `path`: string | Start recording to `path` (`wl-screenrec -f`) |
+| `stop()` | — | Stop active recording (`kill -INT`) |
+| `clip()` | — | Save replay buffer (`killall -USR1 wl-screenrec`) and emit `clipped` |
+
+### Signals
+
+| Signal | Arguments |
+| --- | --- |
+| `finished(path)` | Emitted when recording finishes |
+| `clipped()` | Emitted after `clip()` succeeds |
+| `error(message)` | Emitted on spawn/wait/kill failures |
+
+```qml
+// Regular recording
+System.ScreenRec.audio = true
+System.ScreenRec.display = true
+System.ScreenRec.start("/tmp/out.mp4")
+System.ScreenRec.stop()
+
+// Replay/history (auto-starts if replay:true)
+System.ScreenRec.replay = true
+System.ScreenRec.time = 30
+System.ScreenRec.fps = 60
+System.ScreenRec.clip()
+System.ScreenRec.clipped.connect(() => console.log("clip saved"))
+System.ScreenRec.finished.connect((path) => console.log("saved to", path))
+```
+
+History mode writes to `$HOME/Videos/replay_YYYYmmdd_HHMMSS.mp4` by default (created if needed; `dirs::video_dir` fallback to `~/Videos`). Regular `start(path)` still uses the caller-provided path.
+
+Requires `wl-screenrec`, `slurp` (for geometry), `pactl` or `wpctl` (for audio monitor detection), and `kill`/`killall` (`psmisc`) or `pkill` (`procps`) for `clip` (`clip` now tries `kill -USR1 <pid>` first, falling back to `killall`/`pkill`).
+
 ## Colorscheme — `System.Colorscheme`
 
 Generates and applies a Material You color scheme via [matugen](https://github.com/InioX/matugen).
