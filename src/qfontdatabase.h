@@ -32,8 +32,11 @@ inline void system_set_application_font(const QString &family, int pointSize)
     if (!app)
         return;
 
-    QFont font = app->font();
-    font.setFamily(family);
+    QString trimmed = family.trimmed();
+    if (trimmed.isEmpty())
+        return;
+
+    QFont font(trimmed);
     if (pointSize > 0)
         font.setPointSize(pointSize);
     app->setFont(font);
@@ -41,6 +44,8 @@ inline void system_set_application_font(const QString &family, int pointSize)
 
 inline bool system_font_is_monospace(const QString &family)
 {
-    QFont font(family);
-    return font.fixedPitch();
+    // NOTE: QFont(family).fixedPitch() only reflects the flag set on that
+    // QFont instance (false by default) — it does NOT query the font
+    // database. QFontDatabase::isFixedPitch() is the correct query.
+    return QFontDatabase::isFixedPitch(family);
 }
