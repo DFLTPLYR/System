@@ -46,32 +46,34 @@ Text { text: "CPU: " + System.Hardware.cpu_usage.toFixed(1) + "%" }
 
 ## ScreenRecord — `System.ScreenRec`
 
-Screen/audio capture via [`wl-screenrec`](https://github.com/russelltg/wl-screenrec) (wlroots). Regular recording uses `wl-screenrec -f <path>` with optional `slurp` geometry selection and audio capture. Replay/history mode uses `wl-screenrec --history {time} --max-fps {fps}` started at initialization when `replay` is `true`, and `clip()` triggers `killall -USR1 wl-screenrec` to save the recent buffer.
+Screen/audio capture via [`gpu-screen-recorder`](https://git.dec05eba.com/gpu-screen-recorder/about). Regular recording uses `gpu-screen-recorder -w <target> -c mp4 -f <fps> -o <path>` with optional `slurp` geometry selection and desktop audio capture. Replay mode runs `gpu-screen-recorder -w <target> -c mp4 -f <fps> -r <duration> -o <Videos>` started when `replay` is `true`, and `clip()` triggers `kill -SIGUSR1 <pid>` (saves the buffer as `Replay_*.mp4`, daemon keeps running).
 
 | Property | Type | Description |
 | --- | --- | --- |
-| `is_running` | bool | `true` while a regular recording is active |
-| `audio` | bool | Capture audio (`--audio` + `--audio-device` via `pactl`/`wpctl` monitor) |
-| `display` | bool | `true` = capture output (`-o` via `slurp -o -f "%o"`), `false` = capture region (`-g` via `slurp`) |
-| `replay` | bool | Enable history/replay mode on startup |
-| `monitor` | string | Output/monitor name (used with `-o` when set) |
-| `fps` | int | Max FPS (`--max-fps`) for both regular and history mode |
-| `time` | int | History length in seconds (`--history`) for replay mode (default `30`) |
+| `is_running` | bool | `true` once capture is actually live (after KMS/portal auth) — stays `false` while waiting for permission |
+| `elapsed` | int | Recording elapsed time in seconds, starts ticking once capture is live, resets to `0` on stop |
+| `audio` | bool | Capture desktop audio (`-a default_output`) |
+| `display` | bool | `true` = capture output (`-w` via `slurp -o -f "%o"`), `false` = capture region (`-w region -region` via `slurp -f "%wx%h+%x+%y"`) |
+| `replay` | bool | Enable replay mode on startup |
+| `monitor` | string | Capture target (`-w`): monitor name, `screen`, `portal`, … (empty = `screen`) |
+| `fps` | int | Frame rate (`-f`) for both regular and replay mode |
+| `duration` | int | Replay buffer length in seconds (`-r`) (default `30`, clamped 2–3600) |
 
 ### Functions
 
 | Function | Arguments | Description |
 | --- | --- | --- |
-| `start(path)` | `path`: string | Start recording to `path` (`wl-screenrec -f`) |
-| `stop()` | — | Stop active recording (`kill -INT`) |
-| `clip()` | — | Save replay buffer (`killall -USR1 wl-screenrec`) and emit `clipped` |
+| `start(path)` | `path`: string | Request recording to `path` (`is_running`/`started` fire once capture goes live, `error` if auth is denied) |
+| `stop()` | — | Stop active recording (`kill -INT`, finalizes the file) |
+| `clip()` | — | Save replay buffer (`kill -SIGUSR1`, daemon keeps running) and emit `clipped(path)` |
 
 ### Signals
 
 | Signal | Arguments |
 | --- | --- |
+| `started()` | Emitted when capture actually begins (after auth) |
 | `finished(path)` | Emitted when recording finishes |
-| `clipped()` | Emitted after `clip()` succeeds |
+| `clipped(path)` | Emitted after `clip()` succeeds with the saved file path |
 | `error(message)` | Emitted on spawn/wait/kill failures |
 
 ```qml
@@ -83,16 +85,16 @@ System.ScreenRec.stop()
 
 // Replay/history (auto-starts if replay:true)
 System.ScreenRec.replay = true
-System.ScreenRec.time = 30
+System.ScreenRec.duration = 30
 System.ScreenRec.fps = 60
 System.ScreenRec.clip()
 System.ScreenRec.clipped.connect(() => console.log("clip saved"))
 System.ScreenRec.finished.connect((path) => console.log("saved to", path))
 ```
 
-History mode writes to `$HOME/Videos/replay_YYYYmmdd_HHMMSS.mp4` by default (created if needed; `dirs::video_dir` fallback to `~/Videos`). Regular `start(path)` still uses the caller-provided path.
+History mode saves to `$HOME/Videos/Replay_YYYY-MM-DD_HH-MM-SS.mp4` (created if needed; `dirs::video_dir` fallback to `~/Videos`). The daemon keeps buffering after each clip (ShadowPlay-style). Regular `start(path)` still uses the caller-provided path.
 
-Requires `wl-screenrec`, `slurp` (for geometry), `pactl` or `wpctl` (for audio monitor detection), and `kill`/`killall` (`psmisc`) or `pkill` (`procps`) for `clip` (`clip` now tries `kill -USR1 <pid>` first, falling back to `killall`/`pkill`).
+Requires `gpu-screen-recorder`, `slurp` (for geometry), and `kill`/`pkill` (`procps`) for signaling (`clip` tries `kill -USR1 <pid>` first, falling back to `pkill -SIGUSR1 -f gpu-screen-recorder`).
 
 ## Colorscheme — `System.Colorscheme`
 
@@ -131,25 +133,62 @@ Lists fonts available on the system via Qt's `QFontDatabase`.
 
 | Property | Type | Description |
 | --- | --- | --- |
-| `list` | list\<string\> | All font family names |
-| `families_json` | string | JSON object: `family -> style -> [sizes]` (smooth point sizes) |
+| `list` | list\<object\> | One object per font family: `{ name, family, families, category, mono }` |
 | `current` | string | The system's current default font family name |
+| `app_font_family` | string | Last family passed to `apply()` |
+| `app_font_size` | int | Last size passed to `apply()` |
+
+Each `list` entry is a real QML object (a `QVariantMap`), so it supports
+JS array helpers like `filter`/`map`/`find` without `JSON.parse`:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `name` / `family` / `families` | string | Font family name (e.g. `"Inter"`) — three aliases for the same value |
+| `category` | string | `"monospace"` or `"sans-serif"` |
+| `mono` | bool | Same as `category === "monospace"` |
 
 ### Functions
 
 | Function | Arguments | Description |
 | --- | --- | --- |
 | `refresh()` | — | Re-scan fonts on a background thread (runs automatically at startup) |
+| `apply(family, pointSize, category)` | `family`: string or list object, `pointSize`: int, `category`: string (`"monospace"`/`"sans-serif"`/`"serif"`) | Set the app font, persist a fontconfig alias, and publish `current`/`app_font_family`/`app_font_size` |
+
+`apply()` accepts a plain name (`"Inter"`), a legacy JSON string, or a full
+`list` entry object.
 
 Populated asynchronously — bind to the properties rather than reading immediately
 after construction.
 
 ```qml
+// Filter by category or name — no JSON.parse needed.
+property var monoFonts: System.SysFont.list.filter(s => s.category === "monospace")
+property var inter: System.SysFont.list.filter(s => s.families === "Inter")
+// `family` and `name` are aliases of `families`:
+property var found: System.SysFont.list.find(s => s.family === "Inter")
+
 ListView {
     model: System.SysFont.list
-    delegate: Text { text: modelData }
+    delegate: Text { text: modelData.name }
 }
+
+// All of these work:
+System.SysFont.apply("Inter", 12, "sans-serif")
+System.SysFont.apply(monoFonts[0], 12, "monospace")
+System.SysFont.apply(monoFonts[0].name, 12, "monospace")
 ```
+
+> Troubleshooting an empty `filter()` result:
+> - `family` / `families` / `name` hold the font **name** (`"Inter"`).
+>   `category` holds `"monospace"` / `"sans-serif"` — so
+>   `filter(s => s.families === "sans-serif")` is always `[]`; use
+>   `filter(s => s.category === "sans-serif")`.
+> - `list` fills in asynchronously. A `property var x: SysFont.list.filter(...)`
+>   snapshot taken at startup stays `[]`; recompute in
+>   `onListChanged` or guard with `SysFont.list.length`.
+> - Console shows entries as `[object V4ReferenceObject]` — that is normal
+>   rendering for these objects; check fields with
+>   `JSON.stringify(SysFont.list[0])` and `Object.keys(SysFont.list[0])`.
 
 ## FileManager — `System.FileManager`
 

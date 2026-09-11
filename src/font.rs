@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::thread;
 
 use cxx_qt::Threading;
-use cxx_qt_lib::{QList, QString, QStringList};
+use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QStringList, QVariant};
 
 #[cxx_qt::bridge]
 mod font {
@@ -11,9 +11,12 @@ mod font {
         include!("cxx-qt-lib/qstring.h");
         include!("cxx-qt-lib/qstringlist.h");
         include!("cxx-qt-lib/qlist.h");
+        include!("cxx-qt-lib/qvariant.h");
+        include!("cxx-qt-lib/qmap.h");
         type QString = cxx_qt_lib::QString;
         type QStringList = cxx_qt_lib::QStringList;
-        type QList_QString = cxx_qt_lib::QList<QString>;
+        type QVariant = cxx_qt_lib::QVariant;
+        type QList_QVariant = cxx_qt_lib::QList<QVariant>;
         type QList_i32 = cxx_qt_lib::QList<i32>;
     }
 
@@ -32,7 +35,7 @@ mod font {
         #[qobject]
         #[qml_element]
         #[qml_singleton]
-        #[qproperty(QList_QString, list)]
+        #[qproperty(QList_QVariant, list)]
         #[qproperty(QString, current)]
         #[qproperty(QString, app_font_family)]
         #[qproperty(i32, app_font_size)]
@@ -42,7 +45,7 @@ mod font {
         fn refresh(self: Pin<&mut Self>);
 
         #[qinvokable]
-        fn apply(self: Pin<&mut Self>, family: QString, pointSize: i32, category: QString);
+        fn apply(self: Pin<&mut Self>, family: QVariant, pointSize: i32, category: QString);
     }
 
     impl cxx_qt::Constructor<()> for SysFont {}
@@ -50,7 +53,7 @@ mod font {
 }
 
 pub struct FontRust {
-    pub list: QList<QString>,
+    pub list: QList<QVariant>,
     pub current: QString,
     pub app_font_family: QString,
     pub app_font_size: i32,
@@ -59,7 +62,7 @@ pub struct FontRust {
 impl Default for FontRust {
     fn default() -> Self {
         Self {
-            list: QList::<QString>::default(),
+            list: QList::<QVariant>::default(),
             current: QString::default(),
             app_font_family: QString::default(),
             app_font_size: 12,
@@ -81,19 +84,44 @@ impl font::SysFont {
             font::system_font_families(&mut families);
 
             let mut tree = serde_json::Map::new();
-            let mut list = QList::<QString>::default();
+            let mut list = QList::<QVariant>::default();
 
             for family in families.iter() {
                 let is_mono = font::system_font_is_monospace(&family);
 
                 let category = if is_mono { "monospace" } else { "sans-serif" };
+                let family_name = family.to_string();
 
-                let obj = serde_json::json!({
-                    "family": category,
-                    "name": family.to_string(),
-                    "mono": is_mono
-                });
-                list.append(QString::from(&obj.to_string()));
+                // One entry per font family, exposed to QML as a JS object:
+                // { name, family, families, category, mono }
+                // so QML can do:
+                //   SysFont.list.filter(s => s.category === "monospace")
+                //   SysFont.list.filter(s => s.family === "Inter")
+                //   SysFont.list.filter(s => s.families === "Inter")
+                let mut map = QMap::<QMapPair_QString_QVariant>::default();
+                let q_name = QString::from(&family_name);
+                let q_category = QString::from(category);
+                map.insert_clone(
+                    &QString::from("name"),
+                    &QVariant::from(&q_name),
+                );
+                // `family` is the Qt term for the font name
+                // (QFontDatabase::families()).
+                map.insert_clone(&QString::from("family"), &QVariant::from(&q_name));
+                // `families` alias so `s.families` filtering works too.
+                map.insert_clone(
+                    &QString::from("families"),
+                    &QVariant::from(&q_name),
+                );
+                map.insert_clone(
+                    &QString::from("category"),
+                    &QVariant::from(&q_category),
+                );
+                map.insert_clone(
+                    &QString::from("mono"),
+                    &QVariant::from(&is_mono),
+                );
+                list.append(QVariant::from(&map));
 
                 let mut styles_json = serde_json::Map::new();
                 let mut styles = QStringList::default();
@@ -132,20 +160,12 @@ impl font::SysFont {
         });
     }
 
-    fn apply(mut self: Pin<&mut Self>, family: QString, point_size: i32, category: QString) {
-        let mut family_str = family.to_string();
-        // The QML font list model holds JSON objects
-        // ({"family":..., "name":..., "mono":...}), so tolerate callers
-        // passing the raw model entry instead of a plain family name.
-        let trimmed = family_str.trim();
-        if trimmed.starts_with('{') {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                    family_str = name.to_string();
-                }
-            }
-        }
-        let family_str = family_str.trim().to_string();
+    fn apply(mut self: Pin<&mut Self>, family: QVariant, point_size: i32, category: QString) {
+        // `family` may be a plain string ("Inter"), a legacy JSON string
+        // ('{"name":"Inter",...}'), or a full list entry object
+        // ({name, family, families, category, mono}) when QML passes
+        // `SysFont.list[i]` directly.
+        let family_str = Self::extract_family_name(&family);
         if family_str.is_empty() {
             eprintln!("SysFont.apply: empty family name, ignoring");
             return;
@@ -168,6 +188,49 @@ impl font::SysFont {
         // and the onCurrentChanged logger. QFontDatabase::systemFont() never
         // reflects the user's choice, so publish it here.
         let _ = self.as_mut().set_current(family_q);
+    }
+
+    /// Pull a font family name out of an `apply()` argument.
+    ///
+    /// Accepts a plain family name, a legacy JSON-string entry
+    /// (`{"name":...}` from the old `QList<QString>` model), or a full
+    /// `SysFont.list` object (`{name, family, families, ...}` as a
+    /// `QVariantMap`).
+    fn extract_family_name(family: &QVariant) -> String {
+        // QML object -> QVariantMap.
+        if let Some(map) = family.value::<QMap<QMapPair_QString_QVariant>>() {
+            for key in ["name", "family", "families"] {
+                if let Some(field) = map.get(&QString::from(key)) {
+                    if let Some(s) = field.value::<QString>() {
+                        let s = s.to_string();
+                        if !s.trim().is_empty() {
+                            return s.trim().to_string();
+                        }
+                    }
+                }
+            }
+            return String::new();
+        }
+        // Plain string or legacy JSON string.
+        if let Some(s) = family.value::<QString>() {
+            let s_str = s.to_string();
+            let trimmed = s_str.trim();
+            if trimmed.starts_with('{') {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    for key in ["name", "family", "families"] {
+                        if let Some(name) = v.get(key).and_then(|n| n.as_str()) {
+                            if !name.trim().is_empty() {
+                                // Old model stored the category in `family`,
+                                // so prefer `name` (checked first) over it.
+                                return name.trim().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            return trimmed.to_string();
+        }
+        String::new()
     }
 
     /// Best-effort read of the preferred family for `generic` from the user's
@@ -357,6 +420,7 @@ fn upsert_fontconfig_block(content: &str, generic: &str, preferred: &str) -> Opt
 mod tests {
     use super::font::SysFont;
     use super::upsert_fontconfig_block;
+    use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QVariant};
 
     const LEGACY_CONF: &str = "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n<fontconfig>\n     <alias>\n                    <family>sans-serif</family>\n                    <prefer><family>Fira Code</family></prefer>\n                </alias>\n    <alias binding=\"strong\">\n        <family>monospace</family>\n        <prefer><family>Fira Code</family></prefer>\n    </alias>\n</fontconfig>\n";
 
@@ -418,5 +482,97 @@ mod tests {
             Some("Fira Code")
         );
         assert_eq!(SysFont::extract_preferred(LEGACY_CONF, "serif"), None);
+    }
+
+    fn font_entry_variant(name: &str, category: &str, mono: bool) -> QVariant {
+        let mut map = QMap::<QMapPair_QString_QVariant>::default();
+        let q_name = QString::from(name);
+        let q_category = QString::from(category);
+        map.insert_clone(&QString::from("name"), &QVariant::from(&q_name));
+        map.insert_clone(&QString::from("family"), &QVariant::from(&q_name));
+        map.insert_clone(&QString::from("families"), &QVariant::from(&q_name));
+        map.insert_clone(
+            &QString::from("category"),
+            &QVariant::from(&q_category),
+        );
+        map.insert_clone(&QString::from("mono"), &QVariant::from(&mono));
+        QVariant::from(&map)
+    }
+
+    #[test]
+    fn extract_family_name_from_plain_string() {
+        let v = QVariant::from(&QString::from("Inter"));
+        assert_eq!(SysFont::extract_family_name(&v), "Inter");
+    }
+
+    #[test]
+    fn extract_family_name_from_legacy_json_string() {
+        let json = r#"{"family":"monospace","name":"Fira Code","mono":true}"#;
+        let v = QVariant::from(&QString::from(json));
+        assert_eq!(SysFont::extract_family_name(&v), "Fira Code");
+    }
+
+    #[test]
+    fn extract_family_name_from_object() {
+        let v = font_entry_variant("JetBrainsMono Nerd Font", "monospace", true);
+        assert_eq!(
+            SysFont::extract_family_name(&v),
+            "JetBrainsMono Nerd Font"
+        );
+    }
+
+    #[test]
+    fn list_entry_is_real_qvariantmap() {
+        // QML only auto-converts to JS objects when the stored type is
+        // exactly QVariantMap (see C++ QJSEngine baseline).
+        use cxx_qt_lib::QMetaTypeType;
+        let v = font_entry_variant("Inter", "sans-serif", false);
+        assert_eq!(v.type_id(), QMetaTypeType::QVariantMap);
+        let list_var = QVariant::from(&{
+            let mut l = QList::<QVariant>::default();
+            l.append(font_entry_variant("Inter", "sans-serif", false));
+            l
+        });
+        assert_eq!(list_var.type_id(), QMetaTypeType::QVariantList);
+    }
+
+    #[test]
+    fn list_entry_exposes_filterable_fields() {
+        let mut list = QList::<QVariant>::default();
+        list.append(font_entry_variant("Inter", "sans-serif", false));
+        list.append(font_entry_variant("Fira Code", "monospace", true));
+
+        // Simulate QML: SysFont.list.filter(s => s.category === "monospace")
+        let mut monospace = Vec::new();
+        let mut by_name = Vec::new();
+        for entry in list.iter() {
+            let map = entry
+                .value::<QMap<QMapPair_QString_QVariant>>()
+                .expect("list entry should be a QVariantMap");
+            let category = map
+                .get(&QString::from("category"))
+                .and_then(|v| v.value::<QString>())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            // `families` alias must match what the frontend filters on.
+            let families = map
+                .get(&QString::from("families"))
+                .and_then(|v| v.value::<QString>())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let family = map
+                .get(&QString::from("family"))
+                .and_then(|v| v.value::<QString>())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if category == "monospace" {
+                monospace.push(families.clone());
+            }
+            if family == "Inter" {
+                by_name.push(families);
+            }
+        }
+        assert_eq!(monospace, vec!["Fira Code".to_string()]);
+        assert_eq!(by_name, vec!["Inter".to_string()]);
     }
 }
